@@ -1,0 +1,2 @@
+// Кореневий build-скрипт. Версія плагіна береться з settings.gradle.
+plugins { id 'com.android.application' apply false }

@@ -1,0 +1,71 @@
+name: build-apk
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Перевірка структури проєкту
+        run: |
+          miss=0
+          for f in build.gradle settings.gradle gradle.properties \
+                   app/build.gradle \
+                   app/src/main/AndroidManifest.xml \
+                   app/src/main/java/com/gnssfilter/MainActivity.java \
+                   app/src/main/java/com/gnssfilter/FilterService.java; do
+            if [ -f "$f" ]; then echo "OK        $f"; else echo "ВІДСУТНІЙ $f"; miss=1; fi
+          done
+          echo '--- фактичний вміст репозиторію ---'
+          find . -path ./.git -prune -o -type f -print | sort
+          if [ $miss -ne 0 ]; then
+            echo '::error::Бракує файлів проєкту — див. список вище'
+            exit 1
+          fi
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Build debug APK
+        run: |
+          set -o pipefail
+          gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - name: Причина падіння
+        if: failure()
+        run: |
+          echo '## FAILURE' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          if [ -f build.log ]; then
+            grep -A 40 -m1 'What went wrong' build.log || tail -60 build.log
+          else
+            echo 'build.log відсутній — падіння сталося до кроку збірки'
+          fi >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gnss-filter-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error

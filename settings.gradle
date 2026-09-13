@@ -1,0 +1,11 @@
+pluginManagement {
+    repositories { google(); mavenCentral(); gradlePluginPortal() }
+    // Версія AGP оголошена ТІЛЬКИ тут — єдина точка правди.
+    plugins { id 'com.android.application' version '8.7.2' }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories { google(); mavenCentral() }
+}
+rootProject.name = "GnssFilter"
+include ':app'

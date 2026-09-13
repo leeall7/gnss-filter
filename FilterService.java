@@ -1,0 +1,1549 @@
+package com.gnssfilter;
+
+import android.Manifest;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.app.Service;
+import android.content.Context;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.content.pm.ServiceInfo;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.Path;
+import android.graphics.PixelFormat;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.Icon;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
+import android.location.Criteria;
+import android.location.GnssMeasurement;
+import android.location.GnssMeasurementsEvent;
+import android.location.GnssStatus;
+import android.location.Location;
+import android.location.LocationListener;
+import android.location.LocationManager;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.os.PowerManager;
+import android.os.SystemClock;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.provider.Settings;
+import android.view.Gravity;
+import android.view.View;
+import android.view.WindowManager;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+
+/**
+ * GNSS Filter v5.
+ *
+ * Слідкуємо за ВСІМА джерелами одночасно — GPS, fused, network — і на кожному
+ * циклі вирішуємо, якому можна довіряти. Назовні віддаємо один результат.
+ *
+ * Два різні напади розрізняються явно:
+ *   ПРИДУШЕННЯ (тип 1) — фікса немає, usedInFix падає в нуль.
+ *   ПІДМІНА   (тип 2) — фікс Є і виглядає впевнено, але бреше. Ловиться за
+ *                        сукупністю ознак, головна з яких — розходження з
+ *                        мережевою позицією, яку підмінити набагато важче.
+ *
+ * Ознаки підміни (потрібно щонайменше дві, або одна критична):
+ *   1. Розходження GPS і мережі більше за суму їхніх похибок із запасом.
+ *   2. Стрибок GPS-позиції з неможливою швидкістю.
+ *   3. Вироджені азимут/елевація при сильному сигналі — приймач бачить
+ *      потужні сигнали, але не може розмістити їх на небі.
+ *   4. Аномально рівний C/N0 по всіх супутниках: передавач жарить усі канали
+ *      однаково, реальне небо дає розкид за елевацією.
+ *   5. Просідання AGC відносно адаптивної базової лінії.
+ *   6. Розбіжність часу GPS і системного.
+ */
+public class FilterService extends Service {
+
+    public static final String VER = "6.1";
+    public static final String CH_ID = "gnssfilter";
+    public static final int NOTIF_ID = 1;
+
+    public static final String FUSED_PROVIDER = "fused";
+
+    public static final String S_WARMUP = "WARMUP";
+    public static final String S_GREEN  = "GREEN";
+    public static final String S_YELLOW = "YELLOW";
+    public static final String S_ORANGE = "ORANGE";
+    public static final String S_RED    = "RED";
+
+    public static final int C_GREEN  = 0xFF2E7D32;
+    public static final int C_YELLOW = 0xFFF9A825;
+    public static final int C_ORANGE = 0xFFEF6C00;
+    public static final int C_RED    = 0xFFC62828;
+    public static final int C_GREY   = 0xFF757575;
+
+    // ---- здоров'я GNSS ----
+    /**
+     * Супутників у розв'язку, нижче якого фікс не вважається повноцінним.
+     * Польові дані SM-S948B: чисте небо дає 25-26, деградація 0-4.
+     */
+    private static final int MIN_USED = 8;
+    /**
+     * Поріг ВТРАТИ довіри нижчий за поріг набуття: гістерезис. Польовий лог
+     * 12.09: 23 втрати довіри, з них 9 при usedInFix 5-7 — міське хитання
+     * біля порога, кожне з установкою й зняттям моку.
+     */
+    private static final int MIN_USED_DROP = 5;
+    /** Циклів поспіль поганого GPS до виходу з довіри. */
+    private static final int DEAD_STREAK = 3;
+    /** Циклів поспіль доброго GPS до повернення довіри. */
+    private static final int ALIVE_STREAK = 5;
+    /** Те саме після виявленої підміни: спуфер не зникає за п'ять секунд. */
+    private static final int ALIVE_STREAK_SPOOF = 30;
+    /** Стільки чистих ПОВНИХ перевірок (без моку) знімають латч підміни. */
+    private static final int SPOOF_CLEAR_STREAK = 10;
+    private static final long MIN_DWELL_MS = 5000;
+    private static final long GPS_TIMEOUT_MS = 8000;
+    private static final long WARMUP_MS = 10000;
+
+    // ---- ознаки підміни ----
+    /** Частка супутників з нульовими азимутом і елевацією при C/N0 вище порога. */
+    /** На чистому небі 37-42% супутників не мають місця на небі — це норма. */
+    private static final float DEGEN_RATIO = 0.65f;
+    private static final float DEGEN_CN0 = 25f;
+    // Розкид C/N0 як ознака підміни не працює: 5,4 дБ під РЕБ проти 4,4-8,5 дБ
+    // на чистому небі. Метрику лишаємо в логах, з вироку прибрано.
+    /** Просідання AGC відносно адаптивної базової лінії, дБ. */
+    private static final float AGC_DROP = 10f;
+    // ---- мережа як якір ----
+    /**
+     * Зона мережі — двоярусна. 4363 пари справжнього GPS проти мережі (S26):
+     * точна мережа (≤300 м) бреше не більш ніж у 4×, груба — непередбачувано
+     * (Note 20, 15:30: заявлені 500 м, реальні 4 км).
+     */
+    private static final float NET_PRECISE_ACC = 300f;
+    private static final float ZONE_K = 3f, ZONE_MARGIN = 500f;             // точна
+    private static final float ZONE_COARSE_K = 4f, ZONE_COARSE_MARGIN = 5000f; // груба
+    /** Вихід за зону, з якого вирок виноситься одразу, без другого голосу. */
+    private static final float ZONE_CRIT_MIN = 5000f;
+    /** Мережа гірша за це — якорем бути не може. */
+    private static final float NET_ANCHOR_MAX_ACC = 3000f;
+    /**
+     * Проба під латчем — три яруси за тим, хто може підтвердити GPS.
+     * Без ярусу «нікого» застосунок за містом після першої підміни не повернувся б.
+     */
+    private static final long PROBE_INT_PRECISE_MS = 45000, PROBE_INT_COARSE_MS = 180000,
+            PROBE_INT_BLIND_MS = 300000;
+    private static final int STREAK_PRECISE = 20, STREAK_COARSE = 40, STREAK_BLIND = 60;
+    private static final long PROBE_MAX_MS = 25000, PROBE_MAX_COARSE_MS = 50000,
+            PROBE_MAX_BLIND_MS = 75000;
+    // ---- фальшивий рух: акселерометр каже «стоїмо», GPS каже «їдемо» ----
+    private static final int FAKE_MOTION_VOTE_S = 5;
+    private static final int FAKE_MOTION_CRIT_S = 10;
+    private static final float FAKE_MOTION_SPEED = 2f;
+    // ---- утримання без мережі: мок не знімаємо, радіус чесно росте ----
+    private static final float HOLD_GROWTH_MPS = 5f;
+    private static final float HOLD_MAX_ACC = 5000f;
+    /** Розбіжність часу GPS і системного, мс. */
+    private static final long TIME_SKEW_MS = 15000;
+
+    // ---- мережевий режим ----
+    private static final float MAX_SPEED_MPS = 70f;
+    private static final long MAX_NET_AGE_MS = 30000;
+    /**
+     * Свіжість для ВИБОРУ джерела. Польовий лог: застарілий fused (під моком
+     * він не оновлюється) з кращою точністю блокував свіжий network 13 разів.
+     */
+    private static final long ALT_FRESH_MS = 10000;
+    /** Стільки поспіль «сильних» циклів потрібно, щоб із жовтого повернутись у зелений. */
+    private static final int STRONG_STREAK = 5;
+    /**
+     * Максимум екстраполяції. Польові дані: пауза NLP до 10 с, FLP до 7,8 с,
+     * тому 5 с давали б хибний червоний на рівному місці.
+     */
+    private static final long MAX_EXTRAP_MS = 12000;
+    private static final long RED_GRACE_MS = 2000;
+    private static final float MIN_MOVE_MPS = 1.5f;
+    private static final float ACC_GROWTH_MPS = 2f;
+    private static final double V_ALPHA = 0.45;
+    /** Гасіння швидкості на кожному повторі тієї самої координати. */
+    private static final double REPEAT_DECAY = 0.7;
+    /** Похибка, з якою віддається остання точка перед зняттям моку. */
+    private static final float BAILOUT_ACC = 2000f;
+    /** Період публікації у mock. Навігатори помітно чутливі до частоти. */
+    private static final long PUMP_MS = 250;
+
+    private static final double M_PER_DEG = 111320.0;
+
+    // ---- детектор руху за акселерометром ----
+    /** Розкид модуля прискорення (м/с²), вище якого — точно їдемо. */
+    private static final float MOVE_ON = 0.35f;
+    /** Нижче якого — точно стоїмо. Між ними стан не змінюється (гістерезис). */
+    private static final float MOVE_OFF = 0.15f;
+    /** Стільки поспіль «тихих» циклів (1 Гц) потрібно, щоб визнати зупинку. */
+    private static final int STILL_STREAK = 3;
+    /** Згладжування позиції на місці: мережеві стрибки усереднюються. */
+    private static final double STILL_ALPHA = 0.3;
+
+    // ---- стан для UI ----
+    public static volatile boolean running = false;
+    public static volatile String state = "—";
+    public static volatile String reason = "—";
+    public static volatile String source = "—";
+    public static volatile String inSrc = "—";
+    public static volatile int usedInFix = 0;
+    public static volatile int visible = 0;
+    public static volatile float cn0Top = 0;
+    public static volatile float cn0Sd = 0;
+    public static volatile float degenRatio = 0;
+    public static volatile int towValid = 0;
+    public static volatile String spoofFlags = "—";
+    public static volatile float divergence = -1;
+    public static volatile double lat = 0, lon = 0;
+    public static volatile float acc = 0;
+    public static volatile float speedMps = 0;
+    public static volatile float bearingDeg = -1;
+    public static volatile long extrapMs = 0;
+    public static volatile int rejected = 0;
+    public static volatile String lastReject = "—";
+    public static volatile boolean mockActive = false;
+    public static volatile String mockedProviders = "—";
+    public static volatile String mockError = null;
+    public static volatile Map<String, Float> agcDelta = new HashMap<>();
+    public static volatile boolean agcBaseKnown = false;
+
+    public static volatile float accStd = 0;
+    public static volatile boolean moving = false;
+
+    public static volatile int accThreshold = 150;
+    public static volatile boolean mockFused = false;
+    public static volatile boolean showDot = true;
+    public static volatile boolean vibrate = true;
+
+    private LocationManager lm;
+    private Handler h;
+    private PowerManager.WakeLock wl;
+
+    private int badStreak = 0, goodStreak = 0;
+    private boolean gpsTrusted = true;
+    private boolean warm = true;
+    private long startedAt = 0, lastStateChangeAt = 0, redSince = 0;
+    private boolean fusedFailed = false;
+    private String prevState = "";
+    /** Після вироку «підміна» повернення довіри вимагає довшої серії. */
+    private boolean spoofLatch = false;
+    private int strongStreak = 0;
+    private boolean probing = false;
+    private long probeStart = 0, lastProbeEnd = 0;
+    private long stillSince = 0;
+    private int fakeMotion = 0;
+    private boolean lastCrit = false;
+    private boolean precise = false;
+    private double holdLat = 0, holdLon = 0;
+    private float holdAcc = 0;
+    private boolean hasHold = false;
+    private long holdAt = 0;
+
+    private final LinkedHashSet<String> mocked = new LinkedHashSet<>();
+    private final Map<String, Icon> iconCache = new HashMap<>();
+
+    // джерела
+    private Location gpsRaw, netRaw, fusRaw, prevGps;
+    private long gpsAt = 0;
+
+    // опорна точка мережевого режиму
+    private Location ref;
+    private long refAt = 0;
+    private double vE = 0, vN = 0;
+    private double outLat = 0, outLon = 0;
+    private boolean hasOut = false, emitted = false;
+    private double emLat = 0, emLon = 0;
+    private float emAcc = 0, emSpd = 0, emBrg = -1;
+    private int rejectCode = 0;
+
+    // AGC: базова лінія вчиться ЛИШЕ коли GPS у довірі й зберігається між
+    // запусками. Інакше запуск усередині зони РЕБ зробив би базовою саму заваду.
+    private static final int AGC_RING = 300;
+    private static final int AGC_MIN_SAMPLES = 30;
+    private static final String PREFS = "gnssfilter";
+    private final Map<String, float[]> agcRing = new HashMap<>();
+    private final Map<String, Integer> agcPos = new HashMap<>();
+    private final Map<String, Float> agcNow = new HashMap<>();
+    private final Map<String, Float> agcBase = new HashMap<>();
+    private long agcSavedAt = 0;
+
+    private View dot;
+    private GradientDrawable dotBg;
+
+    private SensorManager sm;
+    private final float[] accWin = new float[48];
+    private int accIdx = 0, accCnt = 0;
+    private int stillStreak = 0;
+    private double stillLat = 0, stillLon = 0;
+    private boolean hasStill = false;
+
+    /**
+     * Модуль прискорення не залежить від орієнтації телефона, а сила тяжіння
+     * в розкиді скорочується. Стояча машина з двигуном дає ~0,05-0,15 м/с²,
+     * рух по місту — 0,3-1,0. Саме це розрізняє «стоїмо» від стрибків мережі.
+     */
+    private final SensorEventListener accL = new SensorEventListener() {
+        @Override public void onSensorChanged(SensorEvent e) {
+            float x = e.values[0], y = e.values[1], z = e.values[2];
+            float mag = (float) Math.sqrt(x * x + y * y + z * z);
+            accWin[accIdx] = mag;
+            accIdx = (accIdx + 1) % accWin.length;
+            if (accCnt < accWin.length) accCnt++;
+            if (accCnt < 16) return;
+            float mean = 0;
+            for (int i = 0; i < accCnt; i++) mean += accWin[i];
+            mean /= accCnt;
+            float var = 0;
+            for (int i = 0; i < accCnt; i++) var += (accWin[i] - mean) * (accWin[i] - mean);
+            accStd = (float) Math.sqrt(var / accCnt);
+        }
+        @Override public void onAccuracyChanged(Sensor s, int a) { }
+    };
+
+    /** Гістерезис руху, раз на секунду з step(). */
+    private void updateMotion() {
+        float sd = accStd;
+        if (accCnt < 16) return;                 // датчик ще не набрав вікно
+        if (sd > MOVE_ON) {
+            stillStreak = 0;
+            stillSince = 0;
+            if (!moving) { moving = true; hasStill = false; }
+        } else if (sd < MOVE_OFF) {
+            if (++stillStreak >= STILL_STREAK && moving) {
+                moving = false;
+                vE = 0; vN = 0;                  // стоїмо — рух не екстраполюємо
+                hasStill = false;
+            }
+            if (!moving && stillSince == 0) stillSince = SystemClock.elapsedRealtime();
+        } else {
+            stillStreak = 0;
+        }
+    }
+
+    // ------------------------------------------------------------------
+
+    private static boolean isMock(Location l) {
+        if (l == null) return false;
+        if (Build.VERSION.SDK_INT >= 31) return l.isMock();
+        return l.isFromMockProvider();
+    }
+
+    private static long ageMs(Location l) {
+        return (SystemClock.elapsedRealtimeNanos() - l.getElapsedRealtimeNanos()) / 1000000L;
+    }
+
+    private static String band(double hz) {
+        double f = hz / 1e6;
+        if (f > 1174 && f < 1179) return "1176";
+        if (f > 1559 && f < 1564) return "1561";
+        if (f > 1574 && f < 1577) return "1575";
+        if (f > 1598 && f < 1607) return "1602";
+        return null;
+    }
+
+    // ---- супутники: головне джерело здоров'я GNSS ----
+
+    private final GnssStatus.Callback statusCb = new GnssStatus.Callback() {
+        @Override public void onSatelliteStatusChanged(GnssStatus s) {
+            int n = s.getSatelliteCount();
+            int used = 0, degen = 0, strong = 0;
+            float[] cn = new float[n];
+            int cnN = 0;
+            for (int i = 0; i < n; i++) {
+                if (s.usedInFix(i)) used++;
+                float c = s.getCn0DbHz(i);
+                if (c > 0) cn[cnN++] = c;
+                if (c >= DEGEN_CN0) {
+                    strong++;
+                    // Сильний сигнал без місця на небі — приймач його не прив'язав.
+                    if (s.getAzimuthDegrees(i) == 0f && s.getElevationDegrees(i) == 0f) degen++;
+                }
+            }
+            usedInFix = used;
+            visible = n;
+            degenRatio = strong > 0 ? (float) degen / strong : 0f;
+
+            if (cnN > 0) {
+                float[] c = Arrays.copyOf(cn, cnN);
+                Arrays.sort(c);
+                int k = Math.min(4, cnN);
+                float sum = 0;
+                for (int i = 0; i < k; i++) sum += c[cnN - 1 - i];
+                cn0Top = sum / k;
+                float mean = 0;
+                for (int i = 0; i < cnN; i++) mean += c[i];
+                mean /= cnN;
+                float var = 0;
+                for (int i = 0; i < cnN; i++) var += (c[i] - mean) * (c[i] - mean);
+                cn0Sd = (float) Math.sqrt(var / cnN);
+            } else {
+                cn0Top = 0;
+                cn0Sd = 0;
+            }
+        }
+    };
+
+    /** Вимірювання потрібні лише заради AGC і лічильника декодованого часу. */
+    private final GnssMeasurementsEvent.Callback measCb = new GnssMeasurementsEvent.Callback() {
+        @Override public void onGnssMeasurementsReceived(GnssMeasurementsEvent e) {
+            int tow = 0;
+            Map<String, Float> legacy = new HashMap<>();
+            for (GnssMeasurement m : e.getMeasurements()) {
+                if ((m.getState() & GnssMeasurement.STATE_TOW_DECODED) != 0) tow++;
+                if (m.hasAutomaticGainControlLevelDb() && m.hasCarrierFrequencyHz()) {
+                    String b = band(m.getCarrierFrequencyHz());
+                    if (b != null) legacy.put(b, (float) m.getAutomaticGainControlLevelDb());
+                }
+            }
+            towValid = tow;
+
+            Map<String, Float> modern = new HashMap<>();
+            if (Build.VERSION.SDK_INT >= 34) {
+                try {
+                    for (android.location.GnssAutomaticGainControl g
+                            : e.getGnssAutomaticGainControls()) {
+                        String b = band(g.getCarrierFrequencyHz());
+                        if (b != null) modern.put(b, (float) g.getLevelDb());
+                    }
+                } catch (Throwable ignored) { }
+            }
+            Map<String, Float> a = !modern.isEmpty() ? modern : legacy;
+            if (!a.isEmpty()) updateAgc(a);
+        }
+    };
+
+    /** Поточні рівні прийшли з вимірювань — рахуємо відхилення від бази. */
+    private void updateAgc(Map<String, Float> now) {
+        agcNow.putAll(now);
+        Map<String, Float> d = new HashMap<>();
+        for (Map.Entry<String, Float> en : agcNow.entrySet()) {
+            Float base = agcBase.get(en.getKey());
+            if (base != null) d.put(en.getKey(), en.getValue() - base);
+        }
+        agcDelta = d;
+    }
+
+    /**
+     * Навчання бази. Викликається лише в зеленому стані: те, що ми бачимо
+     * при справному GPS, і є чистим небом за визначенням.
+     */
+    private void learnAgc() {
+        if (agcNow.isEmpty()) return;
+        boolean changed = false;
+        for (Map.Entry<String, Float> en : agcNow.entrySet()) {
+            String b = en.getKey();
+            float[] ring = agcRing.get(b);
+            if (ring == null) {
+                ring = new float[AGC_RING];
+                Arrays.fill(ring, Float.NaN);
+                agcRing.put(b, ring);
+                agcPos.put(b, 0);
+            }
+            int pos = agcPos.get(b);
+            ring[pos] = en.getValue();
+            agcPos.put(b, (pos + 1) % AGC_RING);
+
+            int cnt = 0;
+            float[] tmp = new float[AGC_RING];
+            for (float x : ring) if (!Float.isNaN(x)) tmp[cnt++] = x;
+            if (cnt < AGC_MIN_SAMPLES) continue;
+            float[] sorted = Arrays.copyOf(tmp, cnt);
+            Arrays.sort(sorted);
+            float cand = sorted[(int) (cnt * 0.8f)];
+            Float old = agcBase.get(b);
+            // Тільки вгору: завада лише знижує AGC, тож вища оцінка завжди
+            // ближча до чистого неба. Так база самолікується, але не отруюється.
+            // Змінили тримач і AGC упав назавжди — кнопка скидання.
+            if (old == null || cand > old) {
+                agcBase.put(b, cand);
+                changed = true;
+            }
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (changed && now - agcSavedAt > 60000) {
+            agcSavedAt = now;
+            saveAgcBase();
+        }
+    }
+
+    private void loadAgcBase() {
+        try {
+            android.content.SharedPreferences sp =
+                    getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+            for (String b : new String[]{"1176", "1561", "1575", "1602"}) {
+                float v = sp.getFloat("agc_" + b, Float.NaN);
+                if (!Float.isNaN(v)) agcBase.put(b, v);
+            }
+            agcBaseKnown = !agcBase.isEmpty();
+        } catch (Throwable ignored) { }
+    }
+
+    private void saveAgcBase() {
+        try {
+            android.content.SharedPreferences.Editor e =
+                    getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit();
+            for (Map.Entry<String, Float> en : agcBase.entrySet())
+                e.putFloat("agc_" + en.getKey(), en.getValue());
+            e.apply();
+            agcBaseKnown = true;
+            Logger.event("AGC_BASE", agcBase.toString());
+        } catch (Throwable ignored) { }
+    }
+
+    /** Скидання вивченої бази — якщо телефон переїхав на інший тримач чи авто. */
+    public static void resetAgcBase(Context c) {
+        try {
+            c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply();
+        } catch (Throwable ignored) { }
+    }
+
+    /** Без вивченої бази ознака мовчить: гадати гірше, ніж не знати. */
+    private boolean agcAlarm() {
+        for (Float d : agcDelta.values()) if (d != null && d < -AGC_DROP) return true;
+        return false;
+    }
+
+    // ---- слухачі позицій: усі три, моки відсіюються на вході ----
+
+    private LocationListener listener(final int which) {
+        return new LocationListener() {
+            @Override public void onLocationChanged(Location l) {
+                if (isMock(l)) return;
+                if (which == 0) {
+                    prevGps = gpsRaw;
+                    gpsRaw = l;
+                    gpsAt = SystemClock.elapsedRealtime();
+                } else if (which == 1) {
+                    netRaw = l;
+                } else {
+                    fusRaw = l;
+                }
+            }
+            @Override public void onProviderEnabled(String p) { }
+            @Override public void onProviderDisabled(String p) { }
+            @Override public void onStatusChanged(String p, int s, Bundle b) { }
+        };
+    }
+
+    private final LocationListener gpsL = listener(0);
+    private final LocationListener netL = listener(1);
+    private final LocationListener fusL = listener(2);
+
+    // ------------------------------------------------------------------
+    // оцінка довіри
+
+    /** Найкраще з альтернативних джерел: fused точніший, network — запасний. */
+    private Location bestAlt() {
+        // Поки діє латч підміни, fused не можна брати: він успадковує GPS.
+        return bestAlt(!spoofLatch);
+    }
+
+    private Location bestAlt(boolean allowFused) {
+        Location f = allowFused ? fusRaw : null, n = netRaw;
+        // Кандидат має бути свіжим і ще не спожитим (не той самий об'єкт, що ref).
+        boolean fo = f != null && f.hasAccuracy() && ageMs(f) <= ALT_FRESH_MS && f != ref;
+        boolean no = n != null && n.hasAccuracy() && ageMs(n) <= ALT_FRESH_MS && n != ref;
+        if (fo && no) {
+            boolean pickF = f.getAccuracy() <= n.getAccuracy();
+            inSrc = pickF ? "fused" : "network";
+            return pickF ? f : n;
+        }
+        if (fo) { inSrc = "fused"; return f; }
+        if (no) { inSrc = "network"; return n; }
+        // Нічого нового немає — джерело показуємо за поточною опорою.
+        if (ref != null) inSrc = FUSED_PROVIDER.equals(ref.getProvider()) ? "fused" : "network";
+        else inSrc = "—";
+        return null;
+    }
+
+    /**
+     * Чи можна довіряти поточному GPS-фіксу. Викликається ЛИШЕ коли GPS видно
+     * (мок знято: у довірі або під час проби).
+     *
+     * Мережа — якір. GPS у довірі, якщо він у ЗОНІ мережі; поза зоною — підміна.
+     * Без мережі GPS не перевіряється, і під латчем підміни довіри не буде.
+     * Повертає "" (довіра) або назву причини.
+     */
+    private String gpsVerdict() {
+        Location g = gpsRaw;
+        long now = SystemClock.elapsedRealtime();
+        lastCrit = false;
+
+        int floor = gpsTrusted ? MIN_USED_DROP : MIN_USED;
+        if (usedInFix < floor) {
+            divergence = -1;
+            spoofFlags = agcAlarm() ? "AGC" : "—";
+            return agcAlarm() ? "ЗАВАДА" : "СЛАБКИЙ";
+        }
+        if (g == null || now - gpsAt > GPS_TIMEOUT_MS) {
+            divergence = -1;
+            spoofFlags = "—";
+            return (g == null && now - gpsAt <= GPS_TIMEOUT_MS) ? "" : "НЕМАЄ_ФІКСА";
+        }
+
+        List<String> f = new ArrayList<>();
+        boolean crit = false, anchored = false;
+
+        // --- зона мережі ---
+        Location nl = netRaw;
+        divergence = -1;
+        if (nl != null && nl.hasAccuracy() && ageMs(nl) <= MAX_NET_AGE_MS
+                && nl.getAccuracy() <= NET_ANCHOR_MAX_ACC) {
+            anchored = true;
+            float d = g.distanceTo(nl);
+            divergence = d;
+            float a = nl.getAccuracy();
+            float zone = a <= NET_PRECISE_ACC
+                    ? ZONE_K * a + ZONE_MARGIN
+                    : ZONE_COARSE_K * a + ZONE_COARSE_MARGIN;
+            if (d > zone) {
+                f.add("поза_зоною");
+                if (d > Math.max(2 * zone, ZONE_CRIT_MIN)) crit = true;
+            }
+        }
+
+        // --- фальшивий рух: стоїмо за акселерометром, а GPS «їде» ---
+        if (stillSince > 0 && now - stillSince >= FAKE_MOTION_VOTE_S * 1000L
+                && g.hasSpeed() && g.getSpeed() > FAKE_MOTION_SPEED) {
+            fakeMotion++;
+            f.add("фальш_рух");
+            if (fakeMotion >= FAKE_MOTION_CRIT_S) crit = true;
+        } else {
+            fakeMotion = 0;
+        }
+
+        // --- стрибок ---
+        if (prevGps != null) {
+            long dt = (g.getElapsedRealtimeNanos() - prevGps.getElapsedRealtimeNanos())
+                    / 1000000L;
+            if (dt > 200) {
+                float v = g.distanceTo(prevGps) / (dt / 1000f);
+                if (v > MAX_SPEED_MPS) f.add("стрибок");
+            }
+        }
+
+        if (degenRatio > DEGEN_RATIO) f.add("азимут0");
+
+        long skew = Math.abs(g.getTime() - (System.currentTimeMillis() - ageMs(g)));
+        if (skew > TIME_SKEW_MS) f.add("час");
+
+        int votes = f.size();
+        if (agcAlarm()) f.add("AGC");          // попередження, не голос
+        if (!anchored) f.add("без_мережі");    // інформація, не голос
+        spoofFlags = f.isEmpty() ? "—" : String.join("+", f);
+        lastCrit = crit;
+
+        if (crit) return "ПІДМІНА";
+        if (votes >= 2) return "ПІДМІНА";
+        // Мережа — якір: вихід за її зону сам по собі вирок (через серію DEAD_STREAK).
+        // Фальшивий рух — теж: це прямий фізичний доказ.
+        if (f.contains("поза_зоною") || f.contains("фальш_рух")) return "ПІДМІНА";
+        if (spoofLatch && votes >= 1) return "ПІДМІНА";
+        // Під латчем без мережі проба дозволена лише в «сліпому» ярусі (довгому).
+        if (spoofLatch && !anchored && probeTier > 0) return "НЕ_ПЕРЕВІРЕНО";
+        return "";
+    }
+
+    /** 0 — підтвердити нікому, 1 — груба мережа, 2 — точна. */
+    private int verifierTier() {
+        Location nl = netRaw;
+        if (nl == null || !nl.hasAccuracy() || ageMs(nl) > MAX_NET_AGE_MS
+                || nl.getAccuracy() > NET_ANCHOR_MAX_ACC) return 0;
+        return nl.getAccuracy() <= NET_PRECISE_ACC ? 2 : 1;
+    }
+    private int probeTier = 2;
+
+    private void loseTrust(String verdict, long now) {
+        gpsTrusted = false;
+        lastStateChangeAt = now;
+        probing = false;
+        lastProbeEnd = now;
+        goodStreak = 0;
+        Logger.event("TRUST", "GPS втрачено: " + verdict
+                + (spoofFlags.equals("—") ? "" : " [" + spoofFlags + "]"));
+        if ("ПІДМІНА".equals(verdict)) {
+            spoofLatch = true;
+            if (ref != null && FUSED_PROVIDER.equals(ref.getProvider())) {
+                ref = null;
+                hasOut = false;
+            }
+            vE = 0; vN = 0;
+        } else {
+            seedVelocityFromGps();
+        }
+        installMock();
+    }
+
+    private void gainTrust(long now) {
+        gpsTrusted = true;
+        lastStateChangeAt = now;
+        probing = false;
+        badStreak = 0;
+        hasOut = false;
+        if (spoofLatch) {
+            spoofLatch = false;
+            Logger.event("TRUST", "GPS відновлено, латч підміни знято (у зоні мережі)");
+        } else {
+            Logger.event("TRUST", "GPS відновлено");
+        }
+    }
+
+    private void startProbe(long now) {
+        probing = true;
+        probeStart = now;
+        goodStreak = 0;
+        removeMock();   // GPS стає видимим; навігатор теж бачить його — це ціна проби
+        Logger.event("PROBE", spoofLatch ? "проба під латчем, ярус " + probeTier : "проба");
+    }
+
+    private void endProbe(String why, long now) {
+        probing = false;
+        lastProbeEnd = now;
+        goodStreak = 0;
+        Logger.event("PROBE_END", why);
+        installMock();
+    }
+
+    // ------------------------------------------------------------------
+
+    private final Runnable tick = new Runnable() {
+        @Override public void run() {
+            try { step(); } catch (Throwable t) { mockError = t.toString(); }
+            h.postDelayed(this, 1000);
+        }
+    };
+
+    /** Публікація у mock іде швидше за аналіз: навігатору потрібен рівний потік. */
+    private final Runnable pump = new Runnable() {
+        @Override public void run() {
+            try {
+                if (precise && S_ORANGE.equals(state) && !mocked.isEmpty() && ref != null) {
+                    long age = SystemClock.elapsedRealtime() - refAt;
+                    if (age <= MAX_EXTRAP_MS) emitExtrapolated(age);
+                }
+            } catch (Throwable ignored) { }
+            h.postDelayed(this, PUMP_MS);
+        }
+    };
+
+    private void step() {
+        long now = SystemClock.elapsedRealtime();
+        updateMotion();
+
+        // --- прогрів: до першого фікса або 10 с; мок не ставимо ---
+        if (warm) {
+            if (now - startedAt < WARMUP_MS && gpsRaw == null && usedInFix == 0) {
+                setState(S_WARMUP, "прогрів");
+                emitted = false;
+                trackAlt();
+                publish();
+                return;
+            }
+            warm = false;
+            lastStateChangeAt = now;
+            String v0 = gpsVerdict();
+            gpsTrusted = v0.isEmpty();
+            if (!gpsTrusted) installMock();
+        }
+
+        // ================= GPS У ДОВІРІ: мок знято, навігатор на GPS =================
+        if (gpsTrusted) {
+            String verdict = gpsVerdict();
+            boolean ok = verdict.isEmpty();
+            if (ok) { goodStreak++; badStreak = 0; } else { badStreak++; goodStreak = 0; }
+            boolean spoofNow = "ПІДМІНА".equals(verdict);
+
+            boolean drop;
+            if (spoofNow && (lastCrit || spoofLatch)) {
+                drop = true;                       // критичне або рецидив — негайно
+            } else {
+                drop = badStreak >= DEAD_STREAK && now - lastStateChangeAt >= MIN_DWELL_MS;
+            }
+            if (drop) {
+                loseTrust(verdict, now);
+                // далі — гілка «під моком» у цьому ж циклі
+            } else {
+                boolean weakNow = usedInFix < MIN_USED + 2 || !spoofFlags.equals("—")
+                        || badStreak > 0;
+                if (weakNow) strongStreak = 0; else strongStreak++;
+                boolean weak = weakNow
+                        || (S_YELLOW.equals(state) && strongStreak < STRONG_STREAK);
+                setState(weak ? S_YELLOW : S_GREEN, weak ? "GPS слабкий" : "GPS впевнений");
+                if (!weak && !spoofLatch) learnAgc();
+                source = "GPS";
+                emitted = false;
+                precise = false;
+                trackAlt();
+                removeMock();
+                showFrom(gpsRaw);
+                rememberHold(lat, lon, acc);
+                publish();
+                return;
+            }
+        }
+
+        // ================= ПРОБА: мок знято тимчасово, дивимось на GPS =================
+        if (probing) {
+            String verdict = gpsVerdict();
+            boolean ok = verdict.isEmpty();
+            boolean haveFix = gpsRaw != null && now - gpsAt <= 3000;
+            if ("ПІДМІНА".equals(verdict)) {
+                if (!spoofLatch) spoofLatch = true;
+                endProbe("підміна: " + spoofFlags, now);
+            } else if (!ok) {
+                endProbe(verdict, now);
+            } else if (!haveFix && now - probeStart > PROBE_MAX_MS) {
+                endProbe("фікс не прийшов", now);
+            } else if (!haveFix) {
+                // фікс іще в дорозі: ні добре, ні погано — чекаємо
+                setState(S_YELLOW, "проба GPS: чекаємо фікс");
+                source = "GPS";
+                precise = false;
+                trackAlt();
+                publish();
+                return;
+            } else {
+                goodStreak++;
+                int need = !spoofLatch ? ALIVE_STREAK
+                        : probeTier == 2 ? STREAK_PRECISE
+                        : probeTier == 1 ? STREAK_COARSE : STREAK_BLIND;
+                if (goodStreak >= need) {
+                    gainTrust(now);
+                    setState(S_GREEN, "GPS впевнений");
+                    source = "GPS";
+                    precise = false;
+                    trackAlt();
+                    showFrom(gpsRaw);
+                    rememberHold(lat, lon, acc);
+                    publish();
+                    return;
+                }
+                // Тривалість проби має вміщати потрібну серію свого ярусу.
+                long maxProbe = !spoofLatch ? PROBE_MAX_MS
+                        : probeTier == 2 ? PROBE_MAX_MS
+                        : probeTier == 1 ? PROBE_MAX_COARSE_MS : PROBE_MAX_BLIND_MS;
+                if (now - probeStart > maxProbe) {
+                    endProbe("час вийшов", now);
+                } else {
+                    setState(S_YELLOW, spoofLatch
+                            ? "проба GPS " + goodStreak + "/" + need : "проба GPS");
+                    source = "GPS";
+                    precise = false;
+                    trackAlt();
+                    showFrom(gpsRaw);
+                    publish();
+                    return;
+                }
+            }
+        }
+
+        // ================= ПІД МОКОМ: GPS не видно, вирішує фізика й мережа =============
+        boolean phys = usedInFix >= MIN_USED && !agcAlarm();
+        if (phys) goodStreak++; else goodStreak = 0;
+        if (usedInFix < MIN_USED) spoofFlags = agcAlarm() ? "AGC" : "—";
+        else spoofFlags = agcAlarm() ? "AGC" : "—";
+
+        int tier = verifierTier();
+        long interval = tier == 2 ? PROBE_INT_PRECISE_MS
+                : tier == 1 ? PROBE_INT_COARSE_MS : PROBE_INT_BLIND_MS;
+        boolean canProbe = goodStreak >= ALIVE_STREAK
+                && now - lastStateChangeAt >= MIN_DWELL_MS
+                && (!spoofLatch || now - lastProbeEnd >= interval);
+        if (canProbe) {
+            probeTier = tier;
+            startProbe(now);
+            setState(S_YELLOW, spoofLatch ? "проба GPS під латчем" : "проба GPS");
+            source = "GPS";
+            precise = false;
+            trackAlt();
+            publish();
+            return;
+        }
+
+        String why = spoofLatch ? "підміна GPS"
+                : usedInFix < MIN_USED ? (agcAlarm() ? "завада GNSS" : "слабкий сигнал")
+                : "GPS не перевірено";
+
+        installMock();
+        trackAlt();
+
+        // 1) точна мережа — екстраполяція
+        long age = ref == null ? Long.MAX_VALUE : now - refAt;
+        if (ref != null && age <= MAX_EXTRAP_MS) {
+            precise = true;
+            setState(S_ORANGE, why + ", ведемо з мережі");
+            source = inSrc;
+            emitExtrapolated(age);
+            rememberHold(lat, lon, acc);
+            publish();
+            return;
+        }
+        precise = false;
+
+        // 2) груба мережа — її позиція з чесним радіусом, без руху
+        Location nl = netRaw;
+        if (nl != null && nl.hasAccuracy() && ageMs(nl) <= MAX_NET_AGE_MS
+                && nl.getAccuracy() <= NET_ANCHOR_MAX_ACC) {
+            setState(S_ORANGE, why + ", груба мережа");
+            source = "network";
+            extrapMs = 0;
+            emit(nl.getLatitude(), nl.getLongitude(), nl.getAccuracy(), 0, -1);
+            rememberHold(lat, lon, acc);
+            publish();
+            return;
+        }
+
+        // 3) мережі немає — утримання. Мок стоїть: спуфер до навігатора не дістає.
+        if (hasHold) {
+            float grown = Math.min(HOLD_MAX_ACC,
+                    holdAcc + (now - holdAt) / 1000f * HOLD_GROWTH_MPS);
+            setState(S_RED, why + ", утримання ±" + (int) grown + " м");
+            source = "HOLD";
+            extrapMs = now - holdAt;
+            emit(holdLat, holdLon, grown, 0, -1);
+            publish();
+            return;
+        }
+
+        // 4) утримувати нічого — мок стоїть порожнім, навігатор бачить «немає GPS»
+        setState(S_RED, why + ", позиції немає");
+        source = "—";
+        emitted = false;
+        publish();
+    }
+
+    /** Остання позиція, в яку ми вірили. Основа утримання без мережі. */
+    private void rememberHold(double la, double lo, float a) {
+        if (la == 0 && lo == 0) return;
+        holdLat = la; holdLon = lo; holdAcc = a;
+        holdAt = SystemClock.elapsedRealtime();
+        hasHold = true;
+    }
+
+    /** Приймання мережевої опори. Викликається в будь-якому стані. */
+    private void trackAlt() {
+        Location alt = bestAlt();
+        if (alt == null || alt == ref) return;
+        String why = reject(alt);
+        if (why == null) accept(alt);
+        else if (!gpsTrusted) { rejected++; lastReject = why; }
+    }
+
+    private String reject(Location n) {
+        rejectCode = 0;
+        if (!n.hasAccuracy()) { rejectCode = 1; return "немає поля accuracy"; }
+        long a = ageMs(n);
+        if (a > MAX_NET_AGE_MS) {
+            rejectCode = 2;
+            return String.format(Locale.US, "фікс застарів: %.0f с", a / 1000f);
+        }
+        if (n.getAccuracy() > accThreshold) {
+            rejectCode = 3;
+            return String.format(Locale.US, "точність %.0f м > %d м",
+                    n.getAccuracy(), accThreshold);
+        }
+        if (ref != null) {
+            long dtMs = (n.getElapsedRealtimeNanos() - ref.getElapsedRealtimeNanos())
+                    / 1000000L;
+            if (dtMs > 0) {
+                float d = n.distanceTo(ref);
+                float v = d / (dtMs / 1000f);
+                // Зсув у межах похибок обох точок — не стрибок, а шум або
+                // різниця між джерелами (fused проти network).
+                float noise = n.getAccuracy() + ref.getAccuracy();
+                if (v > MAX_SPEED_MPS && d > noise) {
+                    rejectCode = 4;
+                    return String.format(Locale.US, "стрибок %.1f км за %.0f с (%.0f м/с)",
+                            d / 1000f, dtMs / 1000f, v);
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Прийняли опорну точку. Повторення тієї самої координати НЕ обнуляє
+     * вектор швидкості: NLP повторює позицію майже в половині випадків,
+     * і наївний розрахунок зупиняв би екстраполяцію на ходу.
+     */
+    private void accept(Location n) {
+        if (ref != null) {
+            long dtMs = (n.getElapsedRealtimeNanos() - ref.getElapsedRealtimeNanos())
+                    / 1000000L;
+            double d = n.distanceTo(ref);
+            boolean sameSrc = n.getProvider() != null
+                    && n.getProvider().equals(ref.getProvider());
+            if (d < 1.0) {
+                // Повтор координати: свіжість оновили, швидкість не обнулили,
+                // але гасимо — три повтори поспіль означають, що ми стоїмо.
+                refAt = SystemClock.elapsedRealtime();
+                ref = n;
+                vE *= REPEAT_DECAY; vN *= REPEAT_DECAY;
+                lastReject = "—";
+                return;
+            }
+            if (!sameSrc) {
+                // Джерело змінилось: точку беремо, швидкість не перераховуємо.
+                ref = n;
+                refAt = SystemClock.elapsedRealtime();
+                lastReject = "—";
+                return;
+            }
+            // Зсув менший за похибку котроїсь із точок — це шум, а не рух.
+            // Лог 12.09: стояча машина «їхала» саме на таких стрибках.
+            double noise = Math.max(n.getAccuracy(), ref.getAccuracy());
+            if (!moving || d <= noise) {
+                vE *= REPEAT_DECAY; vN *= REPEAT_DECAY;
+            } else if (dtMs > 500 && dtMs < 30000) {
+                double dt = dtMs / 1000.0;
+                double br = Math.toRadians(ref.bearingTo(n));
+                double sp = d / dt;
+                if (sp <= MAX_SPEED_MPS) {
+                    vE = V_ALPHA * (sp * Math.sin(br)) + (1 - V_ALPHA) * vE;
+                    vN = V_ALPHA * (sp * Math.cos(br)) + (1 - V_ALPHA) * vN;
+                }
+            } else if (dtMs >= 30000) {
+                vE = 0; vN = 0;
+            }
+        }
+        ref = n;
+        refAt = SystemClock.elapsedRealtime();
+        lastReject = "—";
+    }
+
+    private void seedVelocityFromGps() {
+        vE = 0; vN = 0;
+        Location g = gpsRaw;
+        if (g != null && g.hasSpeed() && g.hasBearing() && g.getSpeed() > MIN_MOVE_MPS) {
+            double br = Math.toRadians(g.getBearing());
+            vE = g.getSpeed() * Math.sin(br);
+            vN = g.getSpeed() * Math.cos(br);
+        }
+    }
+
+    private void emitExtrapolated(long ageMs) {
+        if (ref == null) return;
+        double dt = ageMs / 1000.0;
+
+        if (!moving) {
+            // Стоїмо: мережеві фікси незалежні, тому їх усереднення сходиться
+            // до справжньої точки. Жодної екстраполяції, курс не публікуємо.
+            if (!hasStill) {
+                stillLat = ref.getLatitude(); stillLon = ref.getLongitude(); hasStill = true;
+            } else {
+                stillLat = STILL_ALPHA * ref.getLatitude() + (1 - STILL_ALPHA) * stillLat;
+                stillLon = STILL_ALPHA * ref.getLongitude() + (1 - STILL_ALPHA) * stillLon;
+            }
+            outLat = stillLat; outLon = stillLon; hasOut = true;
+            extrapMs = ageMs;
+            emit(stillLat, stillLon, ref.getAccuracy(), 0, -1);
+            return;
+        }
+
+        double sp = Math.hypot(vE, vN);
+        double la = ref.getLatitude(), lo = ref.getLongitude();
+        if (sp > MIN_MOVE_MPS) {
+            la += (vN * dt) / M_PER_DEG;
+            double k = M_PER_DEG * Math.cos(Math.toRadians(ref.getLatitude()));
+            if (Math.abs(k) > 1) lo += (vE * dt) / k;
+        }
+        if (hasOut) {
+            float[] r = new float[1];
+            Location.distanceBetween(outLat, outLon, la, lo, r);
+            if (r[0] < ref.getAccuracy()) { la = (la + outLat) / 2; lo = (lo + outLon) / 2; }
+        }
+        outLat = la; outLon = lo; hasOut = true;
+
+        float a = (float) (ref.getAccuracy() + dt * ACC_GROWTH_MPS + sp * dt * 0.5);
+        float br = -1;
+        if (sp > MIN_MOVE_MPS) {
+            br = (float) Math.toDegrees(Math.atan2(vE, vN));
+            if (br < 0) br += 360f;
+        }
+        extrapMs = ageMs;
+        emit(la, lo, a, (float) sp, br);
+    }
+
+    private void emit(double la, double lo, float a, float sp, float br) {
+        emLat = la; emLon = lo; emAcc = a; emSpd = sp; emBrg = br;
+        emitted = true;
+        lat = la; lon = lo; acc = a; speedMps = sp; bearingDeg = br;
+        for (String p : new ArrayList<>(mocked)) {
+            Location l = new Location(p);
+            l.setLatitude(la);
+            l.setLongitude(lo);
+            l.setAccuracy(a);
+            l.setTime(System.currentTimeMillis());
+            l.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
+            if (sp > MIN_MOVE_MPS) {
+                l.setSpeed(sp);
+                l.setSpeedAccuracyMetersPerSecond(Math.max(1f, sp * 0.3f));
+                if (br >= 0) {
+                    l.setBearing(br);
+                    l.setBearingAccuracyDegrees(25f);
+                }
+            }
+            try { lm.setTestProviderLocation(p, l); }
+            catch (Throwable t) { mockError = t.toString(); }
+        }
+    }
+
+    private void showFrom(Location g) {
+        if (g == null) { hasOut = false; return; }
+        lat = g.getLatitude(); lon = g.getLongitude();
+        acc = g.hasAccuracy() ? g.getAccuracy() : 0;
+        speedMps = g.hasSpeed() ? g.getSpeed() : 0;
+        bearingDeg = g.hasBearing() ? g.getBearing() : -1;
+        extrapMs = 0;
+    }
+
+    // ------------------------------------------------------------------
+    // mock
+
+    private void installMock() {
+        boolean wantFused = mockFused && !fusedFailed;
+        if (mocked.isEmpty()) {
+            // Під моком слухач бачитиме лише нас; старий фікс більше не актуальний.
+            gpsRaw = null;
+            prevGps = null;
+        }
+        if (mocked.contains(LocationManager.GPS_PROVIDER)
+                && (!wantFused || mocked.contains(FUSED_PROVIDER))) return;
+        boolean gps = addProvider(LocationManager.GPS_PROVIDER, true);
+        if (wantFused && !addProvider(FUSED_PROVIDER, false)) fusedFailed = true;
+        mockActive = gps;
+        mockedProviders = mocked.isEmpty() ? "—" : String.join(", ", mocked);
+        if (gps) mockError = null;
+    }
+
+    private boolean addProvider(String name, boolean critical) {
+        if (mocked.contains(name)) return true;
+        try { lm.removeTestProvider(name); } catch (Throwable ignored) { }
+        try {
+            if (Build.VERSION.SDK_INT >= 31) {
+                android.location.provider.ProviderProperties p =
+                        new android.location.provider.ProviderProperties.Builder()
+                                .setHasNetworkRequirement(false)
+                                .setHasSatelliteRequirement(false)
+                                .setHasCellRequirement(false)
+                                .setHasMonetaryCost(false)
+                                .setHasAltitudeSupport(false)
+                                .setHasSpeedSupport(true)
+                                .setHasBearingSupport(true)
+                                .setPowerUsage(android.location.provider
+                                        .ProviderProperties.POWER_USAGE_LOW)
+                                .setAccuracy(android.location.provider
+                                        .ProviderProperties.ACCURACY_FINE)
+                                .build();
+                lm.addTestProvider(name, p);
+            } else {
+                lm.addTestProvider(name, false, false, false, false, true, true, true,
+                        Criteria.POWER_LOW, Criteria.ACCURACY_FINE);
+            }
+            lm.setTestProviderEnabled(name, true);
+            mocked.add(name);
+            Logger.event("MOCK_ADD", name);
+            return true;
+        } catch (SecurityException se) {
+            if (critical) mockError =
+                    "Оберіть GNSS Filter у Developer options → Select mock location app";
+            Logger.event("MOCK_DENIED", name);
+            return false;
+        } catch (Throwable t) {
+            if (critical) mockError = t.toString();
+            Logger.event("MOCK_FAIL", name + " " + t);
+            return false;
+        }
+    }
+
+    private void removeMock() {
+        if (mocked.isEmpty()) { mockActive = false; mockedProviders = "—"; return; }
+        Logger.event("MOCK_REMOVE", String.join(", ", mocked));
+        for (String p : new ArrayList<>(mocked)) {
+            try { lm.setTestProviderEnabled(p, false); } catch (Throwable ignored) { }
+            try { lm.removeTestProvider(p); } catch (Throwable ignored) { }
+        }
+        mocked.clear();
+        mockActive = false;
+        fusedFailed = false;
+        mockedProviders = "—";
+        hasOut = false;
+
+        // Польовий лог 12.09 (S26 Ultra, Android 16): після зняття тестового
+        // провайдера справжній GPS-фікс до слухача НЕ повертався сам —
+        // 13 з 23 втрат довіри були саме цим, петля з періодом 10 с.
+        // Тому підписку на GPS перевидаємо явно, а таймер свіжості фікса
+        // запускаємо з нуля: 8 с на те, щоб фікс знову почав приходити.
+        try { lm.removeUpdates(gpsL); } catch (Throwable ignored) { }
+        try {
+            lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000, 0,
+                    gpsL, Looper.getMainLooper());
+        } catch (Throwable ignored) { }
+        gpsAt = SystemClock.elapsedRealtime();
+        Logger.event("GPS_RESUB", "підписку на GPS перевидано");
+    }
+
+    public static void forceCleanup(Context c) {
+        LocationManager lm = (LocationManager) c.getSystemService(Context.LOCATION_SERVICE);
+        if (lm == null) return;
+        String[] all = { LocationManager.GPS_PROVIDER, FUSED_PROVIDER,
+                LocationManager.NETWORK_PROVIDER };
+        for (String p : all) {
+            try { lm.setTestProviderEnabled(p, false); } catch (Throwable ignored) { }
+            try { lm.removeTestProvider(p); } catch (Throwable ignored) { }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // індикація
+
+    public static int colorOf(String s) {
+        if (S_GREEN.equals(s)) return C_GREEN;
+        if (S_YELLOW.equals(s)) return C_YELLOW;
+        if (S_ORANGE.equals(s)) return C_ORANGE;
+        if (S_RED.equals(s)) return C_RED;
+        return C_GREY;
+    }
+
+    private void setState(String s, String why) {
+        state = s;
+        reason = why;
+    }
+
+    private Icon iconFor(String s) {
+        Icon cached = iconCache.get(s);
+        if (cached != null) return cached;
+        int n = 96, c = n / 2;
+        Bitmap b = Bitmap.createBitmap(n, n, Bitmap.Config.ARGB_8888);
+        Canvas cv = new Canvas(b);
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        p.setColor(Color.WHITE);
+        if (S_GREEN.equals(s)) {
+            cv.drawCircle(c, c, 34, p);
+        } else if (S_YELLOW.equals(s)) {
+            p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(13);
+            cv.drawCircle(c, c, 29, p);
+        } else if (S_ORANGE.equals(s)) {
+            Path path = new Path();
+            path.moveTo(c, 12); path.lineTo(n - 10, n - 16); path.lineTo(10, n - 16);
+            path.close();
+            cv.drawPath(path, p);
+        } else if (S_RED.equals(s)) {
+            p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(15);
+            p.setStrokeCap(Paint.Cap.ROUND);
+            cv.drawLine(20, 20, n - 20, n - 20, p);
+            cv.drawLine(n - 20, 20, 20, n - 20, p);
+        } else {
+            p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(9);
+            cv.drawCircle(c, c, 30, p);
+        }
+        Icon ic = Icon.createWithBitmap(b);
+        iconCache.put(s, ic);
+        return ic;
+    }
+
+    private void updateDot(int color) {
+        if (!showDot || !Settings.canDrawOverlays(this)) { removeDot(); return; }
+        try {
+            WindowManager wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+            if (dot == null) {
+                float d = getResources().getDisplayMetrics().density;
+                dotBg = new GradientDrawable();
+                dotBg.setShape(GradientDrawable.OVAL);
+                dotBg.setStroke((int) (2 * d), Color.argb(170, 0, 0, 0));
+                dot = new View(this);
+                dot.setBackground(dotBg);
+                int sz = (int) (16 * d);
+                WindowManager.LayoutParams lp = new WindowManager.LayoutParams(sz, sz,
+                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                                | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                        PixelFormat.TRANSLUCENT);
+                lp.gravity = Gravity.TOP | Gravity.END;
+                lp.x = (int) (8 * d);
+                lp.y = (int) (56 * d);
+                wm.addView(dot, lp);
+            }
+            dotBg.setColor(color);
+            dot.invalidate();
+        } catch (Throwable ignored) { }
+    }
+
+    private void removeDot() {
+        if (dot == null) return;
+        try {
+            WindowManager wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+            wm.removeView(dot);
+        } catch (Throwable ignored) { }
+        dot = null;
+        dotBg = null;
+    }
+
+    private void buzz(String s) {
+        if (!vibrate) return;
+        boolean worse = (S_ORANGE.equals(s) && !S_RED.equals(prevState)) || S_RED.equals(s);
+        if (!worse) return;
+        try {
+            Vibrator v = (Vibrator) getSystemService(VIBRATOR_SERVICE);
+            if (v == null || !v.hasVibrator()) return;
+            v.vibrate(VibrationEffect.createOneShot(
+                    S_RED.equals(s) ? 250 : 120, VibrationEffect.DEFAULT_AMPLITUDE));
+        } catch (Throwable ignored) { }
+    }
+
+    // ------------------------------------------------------------------
+    // лог
+
+    private static String f6(double v) { return String.format(Locale.US, "%.6f", v); }
+    private static String f1(double v) { return String.format(Locale.US, "%.1f", v); }
+
+    private void appendLoc(StringBuilder b, Location l) {
+        if (l == null) { b.append(",,,,"); return; }
+        b.append(f6(l.getLatitude())).append(',')
+         .append(f6(l.getLongitude())).append(',')
+         .append(f1(l.hasAccuracy() ? l.getAccuracy() : 0)).append(',')
+         .append(ageMs(l)).append(',');
+    }
+
+    private String stateRow() {
+        StringBuilder b = new StringBuilder(320);
+        b.append(Logger.utcNow()).append(',')
+         .append(SystemClock.elapsedRealtime()).append(',')
+         .append(VER).append(',').append(Logger.SCHEMA).append(',')
+         .append(state).append(',').append(Logger.esc(reason)).append(',')
+         .append(source).append(',').append(inSrc).append(',')
+         .append(usedInFix).append(',').append(visible).append(',')
+         .append(f1(cn0Top)).append(',').append(f1(cn0Sd)).append(',')
+         .append(f1(degenRatio)).append(',')
+         .append(agcDelta.containsKey("1575") ? f1(agcDelta.get("1575")) : "").append(',')
+         .append(agcDelta.containsKey("1602") ? f1(agcDelta.get("1602")) : "").append(',')
+         .append(towValid).append(',');
+        appendLoc(b, gpsRaw);
+        b.append(gpsTrusted ? 1 : 0).append(',')
+         .append(divergence >= 0 ? f1(divergence) : "").append(',');
+        appendLoc(b, netRaw);
+        appendLoc(b, fusRaw);
+        if (emitted) b.append(f6(emLat)).append(',').append(f6(emLon)).append(',')
+                      .append(f1(emAcc)).append(',').append(f1(emSpd)).append(',')
+                      .append(emBrg >= 0 ? f1(emBrg) : "").append(',')
+                      .append(extrapMs).append(',');
+        else b.append(",,,,,,");
+        b.append(mockActive ? 1 : 0).append(',')
+         .append(rejectCode).append(",,,")
+         .append(Logger.esc(spoofFlags)).append(',')
+         .append(f1(accStd)).append(',')
+         .append(moving ? 1 : 0);
+        return b.toString();
+    }
+
+    private long lastNotif = 0;
+    private void publish() {
+        boolean changed = !state.equals(prevState);
+        long now = SystemClock.elapsedRealtime();
+        Logger.state(stateRow());
+        if (changed) {
+            Logger.event("STATE",
+                    (prevState.isEmpty() ? "—" : prevState) + ">" + state + " " + reason
+                    + (spoofFlags.equals("—") ? "" : " [" + spoofFlags + "]"));
+            buzz(state);
+        }
+        updateDot(colorOf(state));
+        if (!changed && now - lastNotif < 3000) return;
+        lastNotif = now;
+        prevState = state;
+        try {
+            NotificationManager nm =
+                    (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            nm.notify(NOTIF_ID, buildNotif());
+        } catch (Throwable ignored) { }
+    }
+
+    private String subtitle() {
+        if (S_ORANGE.equals(state))
+            return String.format(Locale.US, "%s · ±%.0f м · %.0f км/год",
+                    reason, acc, speedMps * 3.6f);
+        if (S_GREEN.equals(state) || S_YELLOW.equals(state))
+            return reason + " · супутників " + usedInFix;
+        return reason;
+    }
+
+    private Notification buildNotif() {
+        PendingIntent pi = PendingIntent.getActivity(this, 0,
+                new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE);
+        return new Notification.Builder(this, CH_ID)
+                .setContentTitle("GNSS Filter · " + state)
+                .setContentText(subtitle())
+                .setSmallIcon(iconFor(state))
+                .setColor(colorOf(state))
+                .setColorized(true)
+                .setContentIntent(pi)
+                .setOngoing(true)
+                .build();
+    }
+
+    // ------------------------------------------------------------------
+    // життєвий цикл
+
+    private boolean hasLocationPermission() {
+        return checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    public static Intent overlaySettings(Context c) {
+        return new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:" + c.getPackageName()));
+    }
+
+    @Override public void onCreate() {
+        super.onCreate();
+        lm = (LocationManager) getSystemService(LOCATION_SERVICE);
+        h = new Handler(Looper.getMainLooper());
+        Logger.init(this);
+        loadAgcBase();
+        forceCleanup(this);
+    }
+
+    @Override public int onStartCommand(Intent i, int flags, int startId) {
+        if (running) return START_STICKY;
+
+        if (!hasLocationPermission()) {
+            mockError = "Немає дозволу на точну локацію — служба не стартувала";
+            state = "—";
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
+        state = S_WARMUP;
+        reason = "прогрів";
+        try {
+            NotificationManager nm =
+                    (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            NotificationChannel ch = new NotificationChannel(CH_ID, "GNSS Filter",
+                    NotificationManager.IMPORTANCE_LOW);
+            ch.setShowBadge(false);
+            nm.createNotificationChannel(ch);
+            startForeground(NOTIF_ID, buildNotif(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
+        } catch (Throwable t) {
+            mockError = "foreground: " + t;
+            state = "—";
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
+        running = true;
+        mockError = null;
+        warm = true;
+        badStreak = 0; goodStreak = 0;
+        gpsTrusted = true;
+        gpsRaw = null; prevGps = null; netRaw = null; fusRaw = null;
+        ref = null; hasOut = false; emitted = false;
+        vE = 0; vN = 0;
+        gpsAt = 0; redSince = 0;
+        spoofLatch = false;
+        strongStreak = 0;
+        probing = false; probeStart = 0; lastProbeEnd = 0;
+        stillSince = 0; fakeMotion = 0; lastCrit = false; precise = false;
+        hasHold = false; probeTier = 2;
+        usedInFix = 0; visible = 0; towValid = 0;
+        divergence = -1; spoofFlags = "—";
+        agcRing.clear(); agcPos.clear(); agcNow.clear();
+        agcDelta = new HashMap<>();
+        // agcBase НЕ чистимо: вона пережила попередній запуск і це її сенс.
+        startedAt = SystemClock.elapsedRealtime();
+        lastStateChangeAt = startedAt;
+        prevState = "";
+
+        try {
+            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+            wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "gnssfilter:tick");
+            wl.setReferenceCounted(false);
+            wl.acquire();
+        } catch (Throwable ignored) { }
+
+        try {
+            sm = (SensorManager) getSystemService(SENSOR_SERVICE);
+            Sensor a = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+            if (a != null) sm.registerListener(accL, a, SensorManager.SENSOR_DELAY_GAME);
+            else Logger.event("NO_ACCEL", "акселерометра немає — рух не детектується");
+        } catch (Throwable t) { Logger.event("NO_ACCEL", t.toString()); }
+        accCnt = 0; accIdx = 0; stillStreak = 0; moving = false; hasStill = false;
+
+        try { lm.registerGnssStatusCallback(statusCb, h); }
+        catch (Throwable t) { mockError = "status: " + t; }
+        try { lm.registerGnssMeasurementsCallback(measCb, h); }
+        catch (Throwable ignored) { }
+
+        int sub = 0;
+        try {
+            lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000, 0,
+                    gpsL, Looper.getMainLooper());
+            sub++;
+        } catch (Throwable ignored) { }
+        try {
+            lm.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 1000, 0,
+                    netL, Looper.getMainLooper());
+            sub++;
+        } catch (Throwable ignored) { }
+        try {
+            lm.requestLocationUpdates(FUSED_PROVIDER, 1000, 0,
+                    fusL, Looper.getMainLooper());
+            sub++;
+        } catch (Throwable t) {
+            Logger.event("NO_FUSED", t.toString());
+        }
+
+        Logger.event("START", Build.MANUFACTURER + " " + Build.MODEL
+                + " sdk=" + Build.VERSION.SDK_INT + " джерел=" + sub
+                + " mockFused=" + mockFused + " thr=" + accThreshold
+                + " agcBase=" + (agcBaseKnown ? agcBase.toString() : "немає"));
+
+        h.removeCallbacks(tick);
+        h.removeCallbacks(pump);
+        h.post(tick);
+        h.postDelayed(pump, PUMP_MS);
+        return START_STICKY;
+    }
+
+    @Override public void onDestroy() {
+        running = false;
+        Logger.event("STOP", "відкинуто=" + rejected);
+        h.removeCallbacks(tick);
+        h.removeCallbacks(pump);
+        try { if (sm != null) sm.unregisterListener(accL); } catch (Throwable ignored) { }
+        try { lm.unregisterGnssStatusCallback(statusCb); } catch (Throwable ignored) { }
+        try { lm.unregisterGnssMeasurementsCallback(measCb); } catch (Throwable ignored) { }
+        try { lm.removeUpdates(gpsL); } catch (Throwable ignored) { }
+        try { lm.removeUpdates(netL); } catch (Throwable ignored) { }
+        try { lm.removeUpdates(fusL); } catch (Throwable ignored) { }
+        removeMock();
+        removeDot();
+        try { if (wl != null && wl.isHeld()) wl.release(); } catch (Throwable ignored) { }
+        wl = null;
+        state = "—";
+        source = "—";
+        reason = "—";
+        Logger.close();
+        super.onDestroy();
+    }
+
+    @Override public IBinder onBind(Intent i) { return null; }
+}

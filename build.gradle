@@ -1,0 +1,31 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'com.gnssfilter'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.gnssfilter"
+        minSdk 29
+        targetSdk 35
+        versionCode 15
+        versionName "6.1"
+    }
+
+    buildTypes {
+        release { minifyEnabled false }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+        encoding 'UTF-8'
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+dependencies { }
