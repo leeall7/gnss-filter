@@ -76,7 +76,7 @@ import java.util.Map;
  */
 public class FilterService extends Service {
 
-    public static final String VER = "7.0";
+    public static final String VER = "7.2";
     public static final String CH_ID = "gnssfilter";
     public static final int NOTIF_ID = 1;
 
@@ -170,6 +170,17 @@ public class FilterService extends Service {
     // ---- гіроскоп: курс між мережевими фіксами ----
     /** Наскільки мережевий вектор підправляє курс гіроскопа (дрейф ~1°/хв). */
     private static final double HDG_NET_BLEND = 0.2;
+    // ---- груба мережа: фікс — слабка прив'язка, рух між фіксами — наш ----
+    /** Стрибок понад стільки сумарних сигм — підозрілий, чекає підтвердження. */
+    private static final float COARSE_GATE_SIG = 3f;
+    /** Без жодного злиття стільки мс — приймаємо стрибок: ми, мабуть, переїхали. */
+    private static final long COARSE_STALE_MS = 30000;
+    /** Ріст невизначеності: базовий + частка пройденого шляху. */
+    private static final float COARSE_GROW_MPS = 2f;
+    private static final float COARSE_GROW_FRAC = 0.3f;
+    private static final float COARSE_SIG_MIN = 50f;
+    /** Швидкість із довіреного GPS придатна для передбачення стільки мс. */
+    private static final long LAST_SPEED_TTL_MS = 120000;
     // ---- утримання без мережі: мок не знімаємо, радіус чесно росте ----
     private static final float HOLD_GROWTH_MPS = 5f;
     private static final float HOLD_MAX_ACC = 5000f;
@@ -243,7 +254,9 @@ public class FilterService extends Service {
 
     public static volatile float accStd = 0;
     public static volatile boolean moving = false;
-    public static volatile float hdgDeg = -1;        // курс з гіроскопа, -1 = невідомий
+    /** Курс: абсолютний, якщо hdgAbs, інакше — відносний поворот від старту. */
+    public static volatile float hdgDeg = -1;
+    public static volatile boolean hdgAbs = false;
     public static volatile String motionSrc = "—";   // "obd" або "accel"
 
     public static volatile int accThreshold = 150;
@@ -272,11 +285,25 @@ public class FilterService extends Service {
     private int obdMismatch = 0;
     // гравітація (НЧ-фільтр акселерометра) — вісь, навколо якої рахуємо поворот
     private float gLx = 0, gLy = 0, gLz = 9.8f;
-    private double hdg = 0;
-    private boolean hdgValid = false;
+    /** Сирий інтеграл повороту навколо вертикалі. Рахується ЗАВЖДИ з першої події. */
+    private double rawYaw = 0;
+    /** Зсув до справжнього курсу, коли його вдалося дізнатись. */
+    private double hdgOffset = 0;
+    private boolean hdgValid = false;   // маємо абсолютний курс
+    private boolean gyroSeen = false;
     private long gyroTs = 0;
     private boolean lastCrit = false;
     private boolean precise = false;
+    // оцінка в грубому режимі: позиція + сигма, передбачення + корекція
+    private double cLat = 0, cLon = 0;
+    private float cSig = 0;
+    private boolean cValid = false;
+    private long cAt = 0, cPredAt = 0;
+    private Location cLastRaw, cPending;
+    private float lastSpeed = 0;
+    private long lastSpeedAt = 0;
+    private long mockDeniedAt = 0, mockDeniedBuzzAt = 0;
+    public static volatile boolean mockDenied = false;
     private double holdLat = 0, holdLon = 0;
     private float holdAcc = 0;
     private boolean hasHold = false;
@@ -363,29 +390,41 @@ public class FilterService extends Service {
             double gm = Math.sqrt(gLx * gLx + gLy * gLy + gLz * gLz);
             if (gm < 1) return;
             double yaw = (e.values[0] * gLx + e.values[1] * gLy + e.values[2] * gLz) / gm;
-            if (!hdgValid) return;
-            hdg -= Math.toDegrees(yaw * dt);
-            if (hdg < 0) hdg += 360; else if (hdg >= 360) hdg -= 360;
-            hdgDeg = (float) hdg;
+            // Інтегруємо ЗАВЖДИ, ще до того як дізнаємось справжній курс: так
+            // гіроскоп придатний для виявлення поворотів із першої секунди,
+            // а його знак можна перевірити, не рушаючи з місця.
+            rawYaw -= Math.toDegrees(yaw * dt);
+            while (rawYaw < 0) rawYaw += 360;
+            while (rawYaw >= 360) rawYaw -= 360;
+            gyroSeen = true;
+            hdgDeg = (float) heading();
+            hdgAbs = hdgValid;
         }
         @Override public void onAccuracyChanged(Sensor s, int a) { }
     };
 
+    /** Поточний курс: сирий інтеграл плюс зсув до істини. */
+    private double heading() {
+        double h = rawYaw + hdgOffset;
+        while (h < 0) h += 360;
+        while (h >= 360) h -= 360;
+        return h;
+    }
+
     private void seedHeading(float bearing) {
-        hdg = bearing;
-        if (hdg < 0) hdg += 360; else if (hdg >= 360) hdg -= 360;
+        hdgOffset = bearing - rawYaw;
         hdgValid = true;
-        hdgDeg = (float) hdg;
+        hdgAbs = true;
+        hdgDeg = (float) heading();
     }
 
     private void blendHeading(float bearing) {
         if (!hdgValid) { seedHeading(bearing); return; }
-        double d = bearing - hdg;
+        double d = bearing - heading();
         while (d > 180) d -= 360;
         while (d < -180) d += 360;
-        hdg += HDG_NET_BLEND * d;
-        if (hdg < 0) hdg += 360; else if (hdg >= 360) hdg -= 360;
-        hdgDeg = (float) hdg;
+        hdgOffset += HDG_NET_BLEND * d;   // дрейф гіроскопа гасимо зсувом
+        hdgDeg = (float) heading();
     }
 
     /** Гістерезис руху, раз на секунду з step(). OBD має пріоритет над акселерометром. */
@@ -894,6 +933,11 @@ public class FilterService extends Service {
                 Location gg = gpsRaw;
                 if (gg != null && gg.hasBearing() && gg.hasSpeed() && gg.getSpeed() > MIN_MOVE_MPS)
                     seedHeading(gg.getBearing());   // справжній курс — еталон для гіроскопа
+                if (gg != null && gg.hasSpeed()) {
+                    lastSpeed = gg.getSpeed();
+                    lastSpeedAt = now;
+                }
+                cValid = false;                     // груба оцінка стартує заново з GPS
                 source = "GPS";
                 emitted = false;
                 precise = false;
@@ -1004,20 +1048,21 @@ public class FilterService extends Service {
             source = inSrc;
             emitExtrapolated(age);
             rememberHold(lat, lon, acc);
+            cValid = false;     // груба оцінка при потребі стартує з цього виходу
             publish();
             return;
         }
         precise = false;
 
-        // 2) груба мережа — її позиція з чесним радіусом, без руху
+        // 2) груба мережа — фікс лише слабка прив'язка; рух між фіксами рахуємо самі.
+        //    Лог 14.09: сирі грубі фікси стрибали в медіані на 717 м, кожен
+        //    десятий понад 5 км — віддавати їх напряму означало телепортацію.
         Location nl = netRaw;
         if (nl != null && nl.hasAccuracy() && ageMs(nl) <= MAX_NET_AGE_MS
                 && nl.getAccuracy() <= NET_ANCHOR_MAX_ACC) {
             setState(S_ORANGE, why + ", груба мережа");
             source = "network";
-            extrapMs = 0;
-            emit(nl.getLatitude(), nl.getLongitude(), nl.getAccuracy(), 0, -1);
-            rememberHold(lat, lon, acc);
+            coarseStep(nl, now);
             publish();
             return;
         }
@@ -1039,6 +1084,82 @@ public class FilterService extends Service {
         source = "—";
         emitted = false;
         publish();
+    }
+
+    /** Оцінка швидкості для передбачення, м/с: OBD, інакше недавній GPS, інакше 0. */
+    private float speedEstimate(long now) {
+        if (Obd.fresh()) return Math.max(0f, Obd.speedMps());
+        if (!moving) return 0f;
+        if (lastSpeedAt > 0 && now - lastSpeedAt <= LAST_SPEED_TTL_MS) return lastSpeed;
+        return 0f;
+    }
+
+    /**
+     * Груба мережа: передбачення + корекція.
+     *   Передбачення — рух за швидкістю (OBD/недавній GPS) і курсом (гіроскоп),
+     *   невизначеність росте.
+     *   Корекція — новий фікс зливається з вагою за точністю; стрибок понад
+     *   COARSE_GATE_SIG сигм іде в карантин до підтвердження другим фіксом.
+     */
+    private void coarseStep(Location nl, long now) {
+        if (!cValid) {
+            // стартуємо з того, у що вірили востаннє, якщо є; інакше з фікса
+            if (emitted) { cLat = emLat; cLon = emLon; cSig = Math.max(COARSE_SIG_MIN, emAcc); }
+            else { cLat = nl.getLatitude(); cLon = nl.getLongitude(); cSig = nl.getAccuracy(); }
+            cValid = true; cAt = now; cPredAt = now; cPending = null; cLastRaw = null;
+        }
+
+        // --- передбачення ---
+        double dt = (now - cPredAt) / 1000.0;
+        cPredAt = now;
+        float sp = speedEstimate(now);
+        if (dt > 0 && dt < 5) {
+            if (sp > MIN_MOVE_MPS && hdgValid) {
+                double r = Math.toRadians(heading());
+                cLat += (Math.cos(r) * sp * dt) / M_PER_DEG;
+                double k = M_PER_DEG * Math.cos(Math.toRadians(cLat));
+                if (Math.abs(k) > 1) cLon += (Math.sin(r) * sp * dt) / k;
+                cSig += (float) (dt * (COARSE_GROW_MPS + COARSE_GROW_FRAC * sp));
+            } else {
+                cSig += (float) (dt * COARSE_GROW_MPS);
+            }
+        }
+
+        // --- корекція новим фіксом ---
+        if (nl != cLastRaw) {
+            cLastRaw = nl;
+            float a = nl.getAccuracy();
+            float[] rr = new float[1];
+            Location.distanceBetween(cLat, cLon, nl.getLatitude(), nl.getLongitude(), rr);
+            float d = rr[0];
+            if (d <= COARSE_GATE_SIG * (cSig + a)) {
+                double k = (double) (cSig * cSig) / (cSig * cSig + a * a);
+                cLat += k * (nl.getLatitude() - cLat);
+                cLon += k * (nl.getLongitude() - cLon);
+                cSig = (float) Math.max(COARSE_SIG_MIN, Math.sqrt((1 - k) * cSig * cSig));
+                cAt = now; cPending = null;
+            } else if (cPending != null && nl.distanceTo(cPending) <= a) {
+                // другий фікс на тому ж новому місці — це не викид, ми переїхали
+                cLat = nl.getLatitude(); cLon = nl.getLongitude(); cSig = a;
+                cAt = now; cPending = null;
+            } else if (now - cAt > COARSE_STALE_MS) {
+                cLat = nl.getLatitude(); cLon = nl.getLongitude(); cSig = a;
+                cAt = now; cPending = null;
+            } else {
+                cPending = nl;
+            }
+        }
+
+        float rad = cSig * 1.5f;
+        if (cPending != null) {
+            float[] rr = new float[1];
+            Location.distanceBetween(cLat, cLon, cPending.getLatitude(), cPending.getLongitude(), rr);
+            rad = Math.max(rad, rr[0]);       // чесно: є незгода з останнім фіксом
+        }
+        extrapMs = now - cAt;
+        boolean mv = sp > MIN_MOVE_MPS;
+        emit(cLat, cLon, rad, mv ? sp : 0, (mv && hdgValid) ? (float) heading() : -1);
+        rememberHold(lat, lon, acc);
     }
 
     /** Остання позиція, в яку ми вірили. Основа утримання без мережі. */
@@ -1176,7 +1297,7 @@ public class FilterService extends Service {
         double sp = Obd.fresh() ? Obd.speedMps() : Math.hypot(vE, vN);
         double dirE, dirN;
         if (hdgValid) {
-            double r = Math.toRadians(hdg);
+            double r = Math.toRadians(heading());
             dirE = Math.sin(r); dirN = Math.cos(r);
         } else {
             double m = Math.hypot(vE, vN);
@@ -1285,12 +1406,29 @@ public class FilterService extends Service {
             }
             lm.setTestProviderEnabled(name, true);
             mocked.add(name);
+            if (mockDenied && critical) { mockDenied = false; mockError = null; }
             Logger.event("MOCK_ADD", name);
             return true;
         } catch (SecurityException se) {
-            if (critical) mockError =
-                    "Оберіть GNSS Filter у Developer options → Select mock location app";
-            Logger.event("MOCK_DENIED", name);
+            if (critical) {
+                mockError = "МОК ЗАБОРОНЕНО: Developer options → Select mock location app";
+                mockDenied = true;
+                long now = SystemClock.elapsedRealtime();
+                // Лог 14.09: 16 773 записи за день. Раз на хвилину достатньо.
+                if (now - mockDeniedAt > 60000) {
+                    Logger.event("MOCK_DENIED", name);
+                    mockDeniedAt = now;
+                }
+                if (vibrate && now - mockDeniedBuzzAt > 120000) {
+                    mockDeniedBuzzAt = now;
+                    try {
+                        Vibrator v = (Vibrator) getSystemService(VIBRATOR_SERVICE);
+                        if (v != null && v.hasVibrator())
+                            v.vibrate(VibrationEffect.createOneShot(600,
+                                    VibrationEffect.DEFAULT_AMPLITUDE));
+                    } catch (Throwable ignored) { }
+                }
+            }
             return false;
         } catch (Throwable t) {
             if (critical) mockError = t.toString();
@@ -1472,14 +1610,15 @@ public class FilterService extends Service {
                       .append(emBrg >= 0 ? f1(emBrg) : "").append(',')
                       .append(extrapMs).append(',');
         else b.append(",,,,,,");
-        b.append(mockActive ? 1 : 0).append(',')
+        b.append(mockDenied ? -1 : (mockActive ? 1 : 0)).append(',')
          .append(rejectCode).append(',')
          .append(Obd.fresh() ? f1(Obd.speedKmh) : "").append(',')
          .append(Logger.esc(Obd.enabled ? Obd.link : "")).append(',')
          .append(Logger.esc(spoofFlags)).append(',')
          .append(f1(accStd)).append(',')
          .append(moving ? 1 : 0).append(',')
-         .append(hdgValid ? f1(hdg) : "").append(',')
+         .append(gyroSeen ? f1(heading()) : "").append(',')
+         .append(hdgValid ? 1 : 0).append(',')
          .append(motionSrc);
         return b.toString();
     }
@@ -1507,6 +1646,7 @@ public class FilterService extends Service {
     }
 
     private String subtitle() {
+        if (mockDenied) return "МОК ЗАБОРОНЕНО — оберіть застосунок у Developer options";
         if (S_ORANGE.equals(state))
             return String.format(Locale.US, "%s · ±%.0f м · %.0f км/год",
                     reason, acc, speedMps * 3.6f);
@@ -1519,7 +1659,7 @@ public class FilterService extends Service {
         PendingIntent pi = PendingIntent.getActivity(this, 0,
                 new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE);
         return new Notification.Builder(this, CH_ID)
-                .setContentTitle("GNSS Filter · " + state)
+                .setContentTitle(mockDenied ? "GNSS Filter · НЕ ПРАЦЮЄ" : "GNSS Filter · " + state)
                 .setContentText(subtitle())
                 .setSmallIcon(iconFor(state))
                 .setColor(colorOf(state))
@@ -1593,6 +1733,8 @@ public class FilterService extends Service {
         probing = false; probeStart = 0; lastProbeEnd = 0;
         stillSince = 0; fakeMotion = 0; lastCrit = false; precise = false;
         hasHold = false; probeTier = 2; probeFails = 0;
+        cValid = false; cPending = null; cLastRaw = null; lastSpeedAt = 0;
+        mockDenied = false; mockDeniedAt = 0; mockDeniedBuzzAt = 0;
         usedInFix = 0; visible = 0; towValid = 0;
         divergence = -1; spoofFlags = "—";
         agcRing.clear(); agcPos.clear(); agcNow.clear();
@@ -1619,7 +1761,8 @@ public class FilterService extends Service {
             else Logger.event("NO_GYRO", "гіроскопа немає — курс лише з мережі");
         } catch (Throwable t) { Logger.event("NO_ACCEL", t.toString()); }
         accCnt = 0; accIdx = 0; stillStreak = 0; moving = false; hasStill = false;
-        hdgValid = false; hdgDeg = -1; gyroTs = 0; obdMismatch = 0;
+        hdgValid = false; hdgAbs = false; hdgDeg = -1; gyroTs = 0;
+        rawYaw = 0; hdgOffset = 0; gyroSeen = false; obdMismatch = 0;
         if (Obd.enabled) Obd.start(this);
 
         try { lm.registerGnssStatusCallback(statusCb, h); }

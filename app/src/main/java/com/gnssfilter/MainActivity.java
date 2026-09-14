@@ -494,12 +494,20 @@ public class MainActivity extends Activity {
         o += "   рух: " + (FilterService.moving ? "їдемо" : "стоїмо")
                 + " (" + FilterService.motionSrc + ")";
         if (FilterService.hdgDeg >= 0)
-            o += String.format(Locale.US, "   курс %.0f°", FilterService.hdgDeg);
+            o += String.format(Locale.US, "   курс %.0f°%s", FilterService.hdgDeg,
+                    FilterService.hdgAbs ? "" : " (відн.)");
         obdLine.setText(o);
 
         if (!hasLocation()) stateWhy.setText("немає дозволу на точну локацію");
-        if (FilterService.mockError != null && run)
+        if (run && FilterService.mockDenied) {
+            hero.setBackground(rounded(0xFFC62828, 18));
+            glyph.setText("⚠");
+            stateWord.setText("Мок заборонено");
+            stateWhy.setText("Developer options → Select mock location app → GNSS Filter. "
+                    + "Після кожного оновлення APK вибір скидається.");
+        } else if (FilterService.mockError != null && run) {
             stateWhy.setText(FilterService.mockError);
+        }
 
         if (diagOpen) {
             StringBuilder b = new StringBuilder();

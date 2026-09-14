@@ -39,7 +39,7 @@ import java.util.zip.ZipOutputStream;
 public final class Logger {
 
     /** Версія схеми CSV. Змінюється лише при зміні набору колонок. */
-    public static final String SCHEMA = "5";
+    public static final String SCHEMA = "6";
 
     private static final int KEEP_DAYS = 14;
     private static final long CAP_BYTES = 200L * 1024 * 1024;
@@ -52,7 +52,7 @@ public final class Logger {
           + "net_lat,net_lon,net_acc,net_age_ms,"
           + "fus_lat,fus_lon,fus_acc,fus_age_ms,"
           + "out_lat,out_lon,out_acc,out_speed,out_bearing,extrap_ms,"
-          + "mock,reject,obd_speed,obd_link,flags,acc_std,moving,hdg,motion_src";
+          + "mock,reject,obd_speed,obd_link,flags,acc_std,moving,hdg,hdg_abs,motion_src";
     private static final String EVENT_HDR = "ts_utc,ts_mono_ms,ver,type,detail";
 
     private static HandlerThread th;
