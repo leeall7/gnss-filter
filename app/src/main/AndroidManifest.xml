@@ -10,6 +10,12 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- OBD через Bluetooth Classic: до 30 — звичайні дозволи, з 31 — runtime -->
+    <uses-permission android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <!-- Потрібен, щоб застосунок з'явився у списку
          Developer options -> Select mock location app. -->
@@ -20,6 +26,7 @@
     <application
         android:label="GNSS Filter"
         android:icon="@android:drawable/ic_menu_mylocation"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:allowBackup="false">
 
         <activity

@@ -76,7 +76,7 @@ import java.util.Map;
  */
 public class FilterService extends Service {
 
-    public static final String VER = "6.1";
+    public static final String VER = "7.0";
     public static final String CH_ID = "gnssfilter";
     public static final int NOTIF_ID = 1;
 
@@ -142,10 +142,17 @@ public class FilterService extends Service {
     private static final float NET_ANCHOR_MAX_ACC = 3000f;
     /**
      * Проба під латчем — три яруси за тим, хто може підтвердити GPS.
-     * Без ярусу «нікого» застосунок за містом після першої підміни не повернувся б.
+     *
+     * Інтервали короткі навмисно. Проба обривається на ПЕРШІЙ ознаці, тому
+     * невдала проба під активним спуфером коштує 1-2 с впливу, а не повної
+     * своєї тривалості. Довгий інтервал економив ці секунди, але після
+     * відбою тримав нас наосліп до п'яти хвилин — асиметрія не на користь.
      */
-    private static final long PROBE_INT_PRECISE_MS = 45000, PROBE_INT_COARSE_MS = 180000,
-            PROBE_INT_BLIND_MS = 300000;
+    private static final long PROBE_INT_PRECISE_MS = 20000, PROBE_INT_COARSE_MS = 40000,
+            PROBE_INT_BLIND_MS = 60000;
+    /** Після кількох поспіль невдалих проб інтервал росте: спуфер нікуди не подівся. */
+    private static final int PROBE_BACKOFF_AFTER = 3;
+    private static final long PROBE_INT_MAX_MS = 180000;
     private static final int STREAK_PRECISE = 20, STREAK_COARSE = 40, STREAK_BLIND = 60;
     private static final long PROBE_MAX_MS = 25000, PROBE_MAX_COARSE_MS = 50000,
             PROBE_MAX_BLIND_MS = 75000;
@@ -153,6 +160,16 @@ public class FilterService extends Service {
     private static final int FAKE_MOTION_VOTE_S = 5;
     private static final int FAKE_MOTION_CRIT_S = 10;
     private static final float FAKE_MOTION_SPEED = 2f;
+    // ---- OBD: швидкість з коліс проти швидкості GPS ----
+    /** Розбіжність GPS і OBD, яку вважаємо значущою: більше з двох. */
+    private static final float OBD_MISMATCH_KMH = 15f;
+    private static final float OBD_MISMATCH_FRAC = 0.30f;
+    private static final int OBD_MISMATCH_VOTE_S = 10, OBD_MISMATCH_CRIT_S = 20;
+    /** Стоїмо за OBD = менше цього. */
+    private static final float OBD_STILL_KMH = 2f;
+    // ---- гіроскоп: курс між мережевими фіксами ----
+    /** Наскільки мережевий вектор підправляє курс гіроскопа (дрейф ~1°/хв). */
+    private static final double HDG_NET_BLEND = 0.2;
     // ---- утримання без мережі: мок не знімаємо, радіус чесно росте ----
     private static final float HOLD_GROWTH_MPS = 5f;
     private static final float HOLD_MAX_ACC = 5000f;
@@ -226,6 +243,8 @@ public class FilterService extends Service {
 
     public static volatile float accStd = 0;
     public static volatile boolean moving = false;
+    public static volatile float hdgDeg = -1;        // курс з гіроскопа, -1 = невідомий
+    public static volatile String motionSrc = "—";   // "obd" або "accel"
 
     public static volatile int accThreshold = 150;
     public static volatile boolean mockFused = false;
@@ -247,8 +266,15 @@ public class FilterService extends Service {
     private int strongStreak = 0;
     private boolean probing = false;
     private long probeStart = 0, lastProbeEnd = 0;
+    private int probeFails = 0;
     private long stillSince = 0;
     private int fakeMotion = 0;
+    private int obdMismatch = 0;
+    // гравітація (НЧ-фільтр акселерометра) — вісь, навколо якої рахуємо поворот
+    private float gLx = 0, gLy = 0, gLz = 9.8f;
+    private double hdg = 0;
+    private boolean hdgValid = false;
+    private long gyroTs = 0;
     private boolean lastCrit = false;
     private boolean precise = false;
     private double holdLat = 0, holdLon = 0;
@@ -302,6 +328,9 @@ public class FilterService extends Service {
     private final SensorEventListener accL = new SensorEventListener() {
         @Override public void onSensorChanged(SensorEvent e) {
             float x = e.values[0], y = e.values[1], z = e.values[2];
+            gLx = 0.9f * gLx + 0.1f * x;
+            gLy = 0.9f * gLy + 0.1f * y;
+            gLz = 0.9f * gLz + 0.1f * z;
             float mag = (float) Math.sqrt(x * x + y * y + z * z);
             accWin[accIdx] = mag;
             accIdx = (accIdx + 1) % accWin.length;
@@ -317,8 +346,63 @@ public class FilterService extends Service {
         @Override public void onAccuracyChanged(Sensor s, int a) { }
     };
 
-    /** Гістерезис руху, раз на секунду з step(). */
+    /**
+     * Курс із гіроскопа. Інтегрується ОДИН раз (кутова швидкість -> кут), тому
+     * поворот на 90° лишається 90° і через хвилину; дрейф близько 1°/хв.
+     * Проєктуємо кутову швидкість на вісь тяжіння — так орієнтація телефона
+     * в тримачі не має значення. Знак: у Android додатне обертання проти
+     * годинникової стрілки, компасний курс росте за годинниковою.
+     */
+    private final SensorEventListener gyroL = new SensorEventListener() {
+        @Override public void onSensorChanged(SensorEvent e) {
+            long ts = e.timestamp;
+            if (gyroTs == 0) { gyroTs = ts; return; }
+            double dt = (ts - gyroTs) / 1e9;
+            gyroTs = ts;
+            if (dt <= 0 || dt > 0.5) return;
+            double gm = Math.sqrt(gLx * gLx + gLy * gLy + gLz * gLz);
+            if (gm < 1) return;
+            double yaw = (e.values[0] * gLx + e.values[1] * gLy + e.values[2] * gLz) / gm;
+            if (!hdgValid) return;
+            hdg -= Math.toDegrees(yaw * dt);
+            if (hdg < 0) hdg += 360; else if (hdg >= 360) hdg -= 360;
+            hdgDeg = (float) hdg;
+        }
+        @Override public void onAccuracyChanged(Sensor s, int a) { }
+    };
+
+    private void seedHeading(float bearing) {
+        hdg = bearing;
+        if (hdg < 0) hdg += 360; else if (hdg >= 360) hdg -= 360;
+        hdgValid = true;
+        hdgDeg = (float) hdg;
+    }
+
+    private void blendHeading(float bearing) {
+        if (!hdgValid) { seedHeading(bearing); return; }
+        double d = bearing - hdg;
+        while (d > 180) d -= 360;
+        while (d < -180) d += 360;
+        hdg += HDG_NET_BLEND * d;
+        if (hdg < 0) hdg += 360; else if (hdg >= 360) hdg -= 360;
+        hdgDeg = (float) hdg;
+    }
+
+    /** Гістерезис руху, раз на секунду з step(). OBD має пріоритет над акселерометром. */
     private void updateMotion() {
+        if (Obd.fresh()) {
+            motionSrc = "obd";
+            boolean mv = Obd.speedKmh >= OBD_STILL_KMH;
+            if (mv) {
+                stillStreak = 0; stillSince = 0;
+                if (!moving) { moving = true; hasStill = false; }
+            } else {
+                if (moving) { moving = false; vE = 0; vN = 0; hasStill = false; }
+                if (stillSince == 0) stillSince = SystemClock.elapsedRealtime();
+            }
+            return;
+        }
+        motionSrc = "accel";
         float sd = accStd;
         if (accCnt < 16) return;                 // датчик ще не набрав вікно
         if (sd > MOVE_ON) {
@@ -619,14 +703,31 @@ public class FilterService extends Service {
             }
         }
 
-        // --- фальшивий рух: стоїмо за акселерометром, а GPS «їде» ---
+        // --- фальшивий рух: стоїмо (OBD або акселерометр), а GPS «їде» ---
+        boolean obd = Obd.fresh();
         if (stillSince > 0 && now - stillSince >= FAKE_MOTION_VOTE_S * 1000L
                 && g.hasSpeed() && g.getSpeed() > FAKE_MOTION_SPEED) {
             fakeMotion++;
-            f.add("фальш_рух");
-            if (fakeMotion >= FAKE_MOTION_CRIT_S) crit = true;
+            f.add(obd ? "фальш_рух_OBD" : "фальш_рух");
+            // З OBD доказ прямий: колеса не крутяться — вирок удвічі швидше.
+            if (fakeMotion >= (obd ? FAKE_MOTION_VOTE_S : FAKE_MOTION_CRIT_S)) crit = true;
         } else {
             fakeMotion = 0;
+        }
+
+        // --- розбіжність швидкостей GPS і OBD: спуфер веде не з нашою швидкістю ---
+        if (obd && g.hasSpeed()) {
+            float gk = g.getSpeed() * 3.6f, ok = Obd.speedKmh;
+            float tol = Math.max(OBD_MISMATCH_KMH, OBD_MISMATCH_FRAC * Math.max(gk, ok));
+            if (Math.abs(gk - ok) > tol) {
+                obdMismatch++;
+                if (obdMismatch >= OBD_MISMATCH_VOTE_S) f.add("швидкість≠OBD");
+                if (obdMismatch >= OBD_MISMATCH_CRIT_S) crit = true;
+            } else {
+                obdMismatch = 0;
+            }
+        } else {
+            obdMismatch = 0;
         }
 
         // --- стрибок ---
@@ -693,6 +794,7 @@ public class FilterService extends Service {
 
     private void gainTrust(long now) {
         gpsTrusted = true;
+        probeFails = 0;
         lastStateChangeAt = now;
         probing = false;
         badStreak = 0;
@@ -717,7 +819,9 @@ public class FilterService extends Service {
         probing = false;
         lastProbeEnd = now;
         goodStreak = 0;
-        Logger.event("PROBE_END", why);
+        if (why.startsWith("підміна")) probeFails++;
+        else if (probeFails > 0) probeFails--;   // не підміна — спуфер міг зникнути
+        Logger.event("PROBE_END", why + " (невдач поспіль: " + probeFails + ")");
         installMock();
     }
 
@@ -787,6 +891,9 @@ public class FilterService extends Service {
                         || (S_YELLOW.equals(state) && strongStreak < STRONG_STREAK);
                 setState(weak ? S_YELLOW : S_GREEN, weak ? "GPS слабкий" : "GPS впевнений");
                 if (!weak && !spoofLatch) learnAgc();
+                Location gg = gpsRaw;
+                if (gg != null && gg.hasBearing() && gg.hasSpeed() && gg.getSpeed() > MIN_MOVE_MPS)
+                    seedHeading(gg.getBearing());   // справжній курс — еталон для гіроскопа
                 source = "GPS";
                 emitted = false;
                 precise = false;
@@ -863,6 +970,11 @@ public class FilterService extends Service {
         int tier = verifierTier();
         long interval = tier == 2 ? PROBE_INT_PRECISE_MS
                 : tier == 1 ? PROBE_INT_COARSE_MS : PROBE_INT_BLIND_MS;
+        if (probeFails >= PROBE_BACKOFF_AFTER) {
+            // Спуфер тримається — не смикаємо мок щодвадцять секунд даремно.
+            long grown = interval * (1L << Math.min(4, probeFails - PROBE_BACKOFF_AFTER + 1));
+            interval = Math.min(PROBE_INT_MAX_MS, grown);
+        }
         boolean canProbe = goodStreak >= ALIVE_STREAK
                 && now - lastStateChangeAt >= MIN_DWELL_MS
                 && (!spoofLatch || now - lastProbeEnd >= interval);
@@ -1018,6 +1130,7 @@ public class FilterService extends Service {
                 if (sp <= MAX_SPEED_MPS) {
                     vE = V_ALPHA * (sp * Math.sin(br)) + (1 - V_ALPHA) * vE;
                     vN = V_ALPHA * (sp * Math.cos(br)) + (1 - V_ALPHA) * vN;
+                    blendHeading(ref.bearingTo(n));   // мережа тримає гіроскоп від дрейфу
                 }
             } else if (dtMs >= 30000) {
                 vE = 0; vN = 0;
@@ -1035,6 +1148,7 @@ public class FilterService extends Service {
             double br = Math.toRadians(g.getBearing());
             vE = g.getSpeed() * Math.sin(br);
             vN = g.getSpeed() * Math.cos(br);
+            seedHeading(g.getBearing());
         }
     }
 
@@ -1057,12 +1171,22 @@ public class FilterService extends Service {
             return;
         }
 
-        double sp = Math.hypot(vE, vN);
+        // Довжина: колеса (OBD), інакше мережевий вектор. Напрямок: гіроскоп,
+        // інакше той самий вектор. Кожне джерело замінює гірше лише коли воно є.
+        double sp = Obd.fresh() ? Obd.speedMps() : Math.hypot(vE, vN);
+        double dirE, dirN;
+        if (hdgValid) {
+            double r = Math.toRadians(hdg);
+            dirE = Math.sin(r); dirN = Math.cos(r);
+        } else {
+            double m = Math.hypot(vE, vN);
+            dirE = m > 0 ? vE / m : 0; dirN = m > 0 ? vN / m : 0;
+        }
         double la = ref.getLatitude(), lo = ref.getLongitude();
         if (sp > MIN_MOVE_MPS) {
-            la += (vN * dt) / M_PER_DEG;
+            la += (dirN * sp * dt) / M_PER_DEG;
             double k = M_PER_DEG * Math.cos(Math.toRadians(ref.getLatitude()));
-            if (Math.abs(k) > 1) lo += (vE * dt) / k;
+            if (Math.abs(k) > 1) lo += (dirE * sp * dt) / k;
         }
         if (hasOut) {
             float[] r = new float[1];
@@ -1071,10 +1195,12 @@ public class FilterService extends Service {
         }
         outLat = la; outLon = lo; hasOut = true;
 
-        float a = (float) (ref.getAccuracy() + dt * ACC_GROWTH_MPS + sp * dt * 0.5);
+        // З OBD похибка екстраполяції менша: швидкість відома на 1-2%, не на 30%.
+        float a = (float) (ref.getAccuracy() + dt * ACC_GROWTH_MPS
+                + sp * dt * (Obd.fresh() ? 0.15 : 0.5));
         float br = -1;
         if (sp > MIN_MOVE_MPS) {
-            br = (float) Math.toDegrees(Math.atan2(vE, vN));
+            br = (float) Math.toDegrees(Math.atan2(dirE, dirN));
             if (br < 0) br += 360f;
         }
         extrapMs = ageMs;
@@ -1347,10 +1473,14 @@ public class FilterService extends Service {
                       .append(extrapMs).append(',');
         else b.append(",,,,,,");
         b.append(mockActive ? 1 : 0).append(',')
-         .append(rejectCode).append(",,,")
+         .append(rejectCode).append(',')
+         .append(Obd.fresh() ? f1(Obd.speedKmh) : "").append(',')
+         .append(Logger.esc(Obd.enabled ? Obd.link : "")).append(',')
          .append(Logger.esc(spoofFlags)).append(',')
          .append(f1(accStd)).append(',')
-         .append(moving ? 1 : 0);
+         .append(moving ? 1 : 0).append(',')
+         .append(hdgValid ? f1(hdg) : "").append(',')
+         .append(motionSrc);
         return b.toString();
     }
 
@@ -1462,7 +1592,7 @@ public class FilterService extends Service {
         strongStreak = 0;
         probing = false; probeStart = 0; lastProbeEnd = 0;
         stillSince = 0; fakeMotion = 0; lastCrit = false; precise = false;
-        hasHold = false; probeTier = 2;
+        hasHold = false; probeTier = 2; probeFails = 0;
         usedInFix = 0; visible = 0; towValid = 0;
         divergence = -1; spoofFlags = "—";
         agcRing.clear(); agcPos.clear(); agcNow.clear();
@@ -1484,8 +1614,13 @@ public class FilterService extends Service {
             Sensor a = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
             if (a != null) sm.registerListener(accL, a, SensorManager.SENSOR_DELAY_GAME);
             else Logger.event("NO_ACCEL", "акселерометра немає — рух не детектується");
+            Sensor gy = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
+            if (gy != null) sm.registerListener(gyroL, gy, SensorManager.SENSOR_DELAY_GAME);
+            else Logger.event("NO_GYRO", "гіроскопа немає — курс лише з мережі");
         } catch (Throwable t) { Logger.event("NO_ACCEL", t.toString()); }
         accCnt = 0; accIdx = 0; stillStreak = 0; moving = false; hasStill = false;
+        hdgValid = false; hdgDeg = -1; gyroTs = 0; obdMismatch = 0;
+        if (Obd.enabled) Obd.start(this);
 
         try { lm.registerGnssStatusCallback(statusCb, h); }
         catch (Throwable t) { mockError = "status: " + t; }
@@ -1529,6 +1664,8 @@ public class FilterService extends Service {
         h.removeCallbacks(tick);
         h.removeCallbacks(pump);
         try { if (sm != null) sm.unregisterListener(accL); } catch (Throwable ignored) { }
+        try { if (sm != null) sm.unregisterListener(gyroL); } catch (Throwable ignored) { }
+        Obd.stop();
         try { lm.unregisterGnssStatusCallback(statusCb); } catch (Throwable ignored) { }
         try { lm.unregisterGnssMeasurementsCallback(measCb); } catch (Throwable ignored) { }
         try { lm.removeUpdates(gpsL); } catch (Throwable ignored) { }
