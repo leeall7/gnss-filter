@@ -76,7 +76,7 @@ import java.util.Map;
  */
 public class FilterService extends Service {
 
-    public static final String VER = "7.2";
+    public static final String VER = "7.4";
     public static final String CH_ID = "gnssfilter";
     public static final int NOTIF_ID = 1;
 
@@ -99,13 +99,15 @@ public class FilterService extends Service {
      * Супутників у розв'язку, нижче якого фікс не вважається повноцінним.
      * Польові дані SM-S948B: чисте небо дає 25-26, деградація 0-4.
      */
-    private static final int MIN_USED = 8;
+    private static final int MIN_USED = 6;
     /**
      * Поріг ВТРАТИ довіри нижчий за поріг набуття: гістерезис. Польовий лог
      * 12.09: 23 втрати довіри, з них 9 при usedInFix 5-7 — міське хитання
      * біля порога, кожне з установкою й зняттям моку.
      */
-    private static final int MIN_USED_DROP = 5;
+    private static final int MIN_USED_DROP = 4;
+    /** Під час проби фікс має бути ще й точним, інакше 6 супутників — замало. */
+    private static final float PROBE_MAX_ACC = 40f;
     /** Циклів поспіль поганого GPS до виходу з довіри. */
     private static final int DEAD_STREAK = 3;
     /** Циклів поспіль доброго GPS до повернення довіри. */
@@ -156,6 +158,24 @@ public class FilterService extends Service {
     private static final int STREAK_PRECISE = 20, STREAK_COARSE = 40, STREAK_BLIND = 60;
     private static final long PROBE_MAX_MS = 25000, PROBE_MAX_COARSE_MS = 50000,
             PROBE_MAX_BLIND_MS = 75000;
+    // ---- статус супутників голодує під моком ----
+    /**
+     * Note 20 / Android 13: із тестовим провайдером GnssStatus звітує 0-1
+     * видимих супутників п'ять годин поспіль, хоч вимірювання йдуть. Гейт
+     * «usedInFix ≥ 6» тоді не відкривається ніколи. Резерв: сирі вимірювання,
+     * а якщо й вони мовчать — проба за розкладом.
+     */
+    private static final int STARVED_VIS = 2;
+    private static final int STARVED_AFTER_S = 30;
+    private static final int STARVED_TOW_MIN = 4;
+    private static final int STARVED_FORCE_AFTER_S = 120;
+    /**
+     * Без латча підміни — проба не рідше ніж раз на стільки. Лог 15.09 (S26,
+     * річка): після завади приймач під моком згасав 25 хв (видимих 44 → 1), а
+     * гейт «6 у розв'язку» чекав його вічно. Проба знімає мок і будить приймач;
+     * під придушенням сирий GPS — це порожнеча, навігатор нічого не втрачає.
+     */
+    private static final long PROBE_MAX_GAP_MS = 180000;
     // ---- фальшивий рух: акселерометр каже «стоїмо», GPS каже «їдемо» ----
     private static final int FAKE_MOTION_VOTE_S = 5;
     private static final int FAKE_MOTION_CRIT_S = 10;
@@ -283,6 +303,11 @@ public class FilterService extends Service {
     private long stillSince = 0;
     private int fakeMotion = 0;
     private int obdMismatch = 0;
+    private int starvedStreak = 0;
+    private boolean starvedLogged = false;
+    // два останні мережеві фікси — свідок нерухомості для «фальшивого руху»
+    private Location netPrev, netCur;
+    private long netPrevAt = 0, netCurAt = 0;
     // гравітація (НЧ-фільтр акселерометра) — вісь, навколо якої рахуємо поворот
     private float gLx = 0, gLy = 0, gLz = 9.8f;
     /** Сирий інтеграл повороту навколо вертикалі. Рахується ЗАВЖДИ з першої події. */
@@ -638,6 +663,20 @@ public class FilterService extends Service {
     }
 
     /** Без вивченої бази ознака мовчить: гадати гірше, ніж не знати. */
+    /**
+     * Мережа каже «стоїмо»: два свіжі фікси з різницею ≥ 5 с на одному місці.
+     * Один застарілий фікс (лог 15.09, 08:15: та сама точка 10 с при їзді
+     * на 36 км/год) свідком не є.
+     */
+    private boolean netStill(long now) {
+        if (netCur == null || netPrev == null) return false;
+        if (now - netCurAt > 15000) return false;
+        if (netCurAt - netPrevAt < 5000) return false;
+        float tol = Math.max(30f, Math.max(netCur.hasAccuracy() ? netCur.getAccuracy() : 30f,
+                netPrev.hasAccuracy() ? netPrev.getAccuracy() : 30f));
+        return netCur.distanceTo(netPrev) < tol;
+    }
+
     private boolean agcAlarm() {
         for (Float d : agcDelta.values()) if (d != null && d < -AGC_DROP) return true;
         return false;
@@ -655,6 +694,8 @@ public class FilterService extends Service {
                     gpsAt = SystemClock.elapsedRealtime();
                 } else if (which == 1) {
                     netRaw = l;
+                    netPrev = netCur; netPrevAt = netCurAt;
+                    netCur = l; netCurAt = SystemClock.elapsedRealtime();
                 } else {
                     fusRaw = l;
                 }
@@ -742,14 +783,18 @@ public class FilterService extends Service {
             }
         }
 
-        // --- фальшивий рух: стоїмо (OBD або акселерометр), а GPS «їде» ---
+        // --- фальшивий рух: GPS «їде», а незалежний свідок каже «стоїмо» ---
+        // Тиша акселерометра САМА ПО СОБІ не голосує: лог 15.09 — три хибні
+        // вироки при плавній їзді на 36 км/год (розкид 0,1 при порозі 0,15).
         boolean obd = Obd.fresh();
-        if (stillSince > 0 && now - stillSince >= FAKE_MOTION_VOTE_S * 1000L
-                && g.hasSpeed() && g.getSpeed() > FAKE_MOTION_SPEED) {
+        boolean obdStill = obd && Obd.speedKmh < OBD_STILL_KMH;
+        boolean accelStill = stillSince > 0 && now - stillSince >= FAKE_MOTION_VOTE_S * 1000L;
+        boolean witness = obdStill || (accelStill && netStill(now));
+        if (witness && g.hasSpeed() && g.getSpeed() > FAKE_MOTION_SPEED) {
             fakeMotion++;
-            f.add(obd ? "фальш_рух_OBD" : "фальш_рух");
+            f.add(obdStill ? "фальш_рух_OBD" : "фальш_рух");
             // З OBD доказ прямий: колеса не крутяться — вирок удвічі швидше.
-            if (fakeMotion >= (obd ? FAKE_MOTION_VOTE_S : FAKE_MOTION_CRIT_S)) crit = true;
+            if (fakeMotion >= (obdStill ? FAKE_MOTION_VOTE_S : FAKE_MOTION_CRIT_S)) crit = true;
         } else {
             fakeMotion = 0;
         }
@@ -851,7 +896,8 @@ public class FilterService extends Service {
         probeStart = now;
         goodStreak = 0;
         removeMock();   // GPS стає видимим; навігатор теж бачить його — це ціна проби
-        Logger.event("PROBE", spoofLatch ? "проба під латчем, ярус " + probeTier : "проба");
+        Logger.event("PROBE", spoofLatch ? "проба під латчем, ярус " + probeTier
+                : (goodStreak >= ALIVE_STREAK ? "проба" : "проба за розкладом (будимо приймач)"));
     }
 
     private void endProbe(String why, long now) {
@@ -970,6 +1016,16 @@ public class FilterService extends Service {
                 trackAlt();
                 publish();
                 return;
+            } else if (gpsRaw != null && gpsRaw.hasAccuracy() && gpsRaw.getAccuracy() > PROBE_MAX_ACC) {
+                // супутників вистачає, а фікс грубий — ще не довіра, але й не провал
+                goodStreak = 0;
+                setState(S_YELLOW, "проба GPS: фікс грубий");
+                source = "GPS";
+                precise = false;
+                trackAlt();
+                showFrom(gpsRaw);
+                publish();
+                return;
             } else {
                 goodStreak++;
                 int need = !spoofLatch ? ALIVE_STREAK
@@ -1006,7 +1062,20 @@ public class FilterService extends Service {
         }
 
         // ================= ПІД МОКОМ: GPS не видно, вирішує фізика й мережа =============
-        boolean phys = usedInFix >= MIN_USED && !agcAlarm();
+        if (visible <= STARVED_VIS) starvedStreak++; else starvedStreak = 0;
+        boolean starved = starvedStreak >= STARVED_AFTER_S;
+        if (starved && !starvedLogged) {
+            starvedLogged = true;
+            Logger.event("STATUS_STARVED", "GnssStatus мовчить під моком; гейт — з вимірювань/розкладу");
+        }
+        boolean phys;
+        if (!starved) {
+            phys = usedInFix >= MIN_USED && !agcAlarm();
+        } else if (starvedStreak >= STARVED_FORCE_AFTER_S) {
+            phys = !agcAlarm();                       // за розкладом, фізику не питаємо
+        } else {
+            phys = towValid >= STARVED_TOW_MIN && !agcAlarm();
+        }
         if (phys) goodStreak++; else goodStreak = 0;
         if (usedInFix < MIN_USED) spoofFlags = agcAlarm() ? "AGC" : "—";
         else spoofFlags = agcAlarm() ? "AGC" : "—";
@@ -1019,9 +1088,11 @@ public class FilterService extends Service {
             long grown = interval * (1L << Math.min(4, probeFails - PROBE_BACKOFF_AFTER + 1));
             interval = Math.min(PROBE_INT_MAX_MS, grown);
         }
-        boolean canProbe = goodStreak >= ALIVE_STREAK
+        boolean overdue = !spoofLatch && now - lastProbeEnd >= PROBE_MAX_GAP_MS
+                && now - lastStateChangeAt >= MIN_DWELL_MS;
+        boolean canProbe = overdue || (goodStreak >= ALIVE_STREAK
                 && now - lastStateChangeAt >= MIN_DWELL_MS
-                && (!spoofLatch || now - lastProbeEnd >= interval);
+                && (!spoofLatch || now - lastProbeEnd >= interval));
         if (canProbe) {
             probeTier = tier;
             startProbe(now);
@@ -1034,6 +1105,7 @@ public class FilterService extends Service {
         }
 
         String why = spoofLatch ? "підміна GPS"
+                : starved ? "статус GNSS недоступний"
                 : usedInFix < MIN_USED ? (agcAlarm() ? "завада GNSS" : "слабкий сигнал")
                 : "GPS не перевірено";
 
@@ -1734,6 +1806,7 @@ public class FilterService extends Service {
         stillSince = 0; fakeMotion = 0; lastCrit = false; precise = false;
         hasHold = false; probeTier = 2; probeFails = 0;
         cValid = false; cPending = null; cLastRaw = null; lastSpeedAt = 0;
+        starvedStreak = 0; starvedLogged = false; netPrev = null; netCur = null;
         mockDenied = false; mockDeniedAt = 0; mockDeniedBuzzAt = 0;
         usedInFix = 0; visible = 0; towValid = 0;
         divergence = -1; spoofFlags = "—";
