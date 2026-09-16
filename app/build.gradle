@@ -8,12 +8,41 @@ android {
         applicationId "com.gnssfilter"
         minSdk 29
         targetSdk 35
-        versionCode 22
-        versionName "8.0"
+        versionCode 24
+        versionName "8.2"
+    }
+
+    /**
+     * Постійний ключ підпису. Без нього кожна збірка підписувалась новим
+     * випадковим debug-ключем, і Android відмовляв в оновленні — доводилось
+     * видаляти застосунок, а разом із ним злітав вибір у Developer options.
+     *
+     * Ключ приходить із секретів GitHub через змінні середовища. Локально,
+     * коли їх немає, збірка тихо лишається debug-підписаною.
+     */
+    signingConfigs {
+        release {
+            def ks = System.getenv("KEYSTORE_FILE")
+            if (ks && file(ks).exists()) {
+                storeFile file(ks)
+                storePassword System.getenv("KEYSTORE_PASSWORD")
+                keyAlias System.getenv("KEY_ALIAS")
+                keyPassword System.getenv("KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
-        release { minifyEnabled false }
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+        debug {
+            // APK з Actions ставиться напряму, тож і debug має бути з тим самим
+            // ключем — інакше оновлення між типами збірки знову ламається.
+            def ks = System.getenv("KEYSTORE_FILE")
+            if (ks && file(ks).exists()) signingConfig signingConfigs.release
+        }
     }
 
     compileOptions {
