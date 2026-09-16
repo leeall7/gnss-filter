@@ -481,6 +481,7 @@ public class MainActivity extends Activity {
 
         String s1 = "Джерело: " + FilterService.source
                 + "   вхід: " + FilterService.inSrc
+                + "   GPS: " + FilterService.gpsSrc
                 + (FilterService.mockActive ? "   [мок]" : "");
         if (FilterService.divergence >= 0)
             s1 += String.format(Locale.US, "   GPS↔мережа %.0f м", FilterService.divergence);

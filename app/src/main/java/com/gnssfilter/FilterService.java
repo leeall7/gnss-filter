@@ -29,6 +29,7 @@ import android.location.GnssStatus;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
+import android.location.OnNmeaMessageListener;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -76,7 +77,7 @@ import java.util.Map;
  */
 public class FilterService extends Service {
 
-    public static final String VER = "7.4";
+    public static final String VER = "8.0";
     public static final String CH_ID = "gnssfilter";
     public static final int NOTIF_ID = 1;
 
@@ -158,6 +159,9 @@ public class FilterService extends Service {
     private static final int STREAK_PRECISE = 20, STREAK_COARSE = 40, STREAK_BLIND = 60;
     private static final long PROBE_MAX_MS = 25000, PROBE_MAX_COARSE_MS = 50000,
             PROBE_MAX_BLIND_MS = 75000;
+    // ---- NMEA: справжня позиція чіпа під моком ----
+    /** NMEA-фікс, старший за це, не рахуємо. */
+    private static final long NMEA_FRESH_MS = 3000;
     // ---- статус супутників голодує під моком ----
     /**
      * Note 20 / Android 13: із тестовим провайдером GnssStatus звітує 0-1
@@ -305,6 +309,11 @@ public class FilterService extends Service {
     private int obdMismatch = 0;
     private int starvedStreak = 0;
     private boolean starvedLogged = false;
+    private final Nmea.Fix nmea = new Nmea.Fix();
+    private Location nmeaLoc;
+    private long nmeaAt = 0;
+    public static volatile String gpsSrc = "—";     // "fix" (провайдер) або "nmea"
+    public static volatile int nmeaSats = 0;
     // два останні мережеві фікси — свідок нерухомості для «фальшивого руху»
     private Location netPrev, netCur;
     private long netPrevAt = 0, netCurAt = 0;
@@ -692,6 +701,7 @@ public class FilterService extends Service {
                     prevGps = gpsRaw;
                     gpsRaw = l;
                     gpsAt = SystemClock.elapsedRealtime();
+                    gpsSrc = "fix";
                 } else if (which == 1) {
                     netRaw = l;
                     netPrev = netCur; netPrevAt = netCurAt;
@@ -704,6 +714,45 @@ public class FilterService extends Service {
             @Override public void onProviderDisabled(String p) { }
             @Override public void onStatusChanged(String p, int s, Bundle b) { }
         };
+    }
+
+    /**
+     * NMEA з чіпа. Під тестовим провайдером Location-фікс до нас не доходить,
+     * а ці речення — доходять, і несуть СПРАВЖНЮ позицію приймача. Тому під
+     * моком саме вони стають gpsRaw: зона мережі, стрибки, фальшивий рух —
+     * усе перевіряється без зняття моку. Проба лишається запасним шляхом.
+     */
+    private final OnNmeaMessageListener nmeaL = new OnNmeaMessageListener() {
+        @Override public void onNmeaMessage(String m, long ts) {
+            if (m == null) return;
+            String t = Nmea.type(m);
+            if (!"GGA".equals(t) && !"RMC".equals(t)) return;
+            if (!Nmea.checksumOk(m)) return;
+            boolean pos = "GGA".equals(t) ? Nmea.parseGGA(m, nmea)
+                    : (Nmea.parseRMC(m, nmea) && nmea.quality > 0);
+            nmeaSats = nmea.sats;
+            if (!pos) return;
+            Location l = new Location("nmea");
+            l.setLatitude(nmea.lat);
+            l.setLongitude(nmea.lon);
+            l.setAccuracy(Nmea.accuracy(nmea));
+            l.setTime(System.currentTimeMillis());
+            l.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
+            if (nmea.speedMps >= 0) l.setSpeed(nmea.speedMps);
+            if (nmea.course >= 0) l.setBearing(nmea.course);
+            nmeaLoc = l;
+            nmeaAt = SystemClock.elapsedRealtime();
+            if (!mocked.isEmpty()) {          // під моком провайдер мовчить
+                prevGps = gpsRaw;
+                gpsRaw = l;
+                gpsAt = nmeaAt;
+                gpsSrc = "nmea";
+            }
+        }
+    };
+
+    private boolean nmeaFresh() {
+        return nmeaLoc != null && SystemClock.elapsedRealtime() - nmeaAt <= NMEA_FRESH_MS;
     }
 
     private final LocationListener gpsL = listener(0);
@@ -751,7 +800,9 @@ public class FilterService extends Service {
         lastCrit = false;
 
         int floor = gpsTrusted ? MIN_USED_DROP : MIN_USED;
-        if (usedInFix < floor) {
+        // GGA рахує супутники з чіпа — це рятує там, де GnssStatus під моком мовчить.
+        int usedEff = Math.max(usedInFix, nmeaFresh() ? nmeaSats : 0);
+        if (usedEff < floor) {
             divergence = -1;
             spoofFlags = agcAlarm() ? "AGC" : "—";
             return agcAlarm() ? "ЗАВАДА" : "СЛАБКИЙ";
@@ -1061,7 +1112,50 @@ public class FilterService extends Service {
             }
         }
 
-        // ================= ПІД МОКОМ: GPS не видно, вирішує фізика й мережа =============
+        // ============ ПІД МОКОМ ============
+        // NMEA дає справжню позицію чіпа повз мок — тоді працює повна перевірка
+        // (зона мережі, стрибок, фальшивий рух), і знімати мок заради проби не треба.
+        if (nmeaFresh()) {
+            String nv = gpsVerdict();
+            boolean nok = nv.isEmpty() && gpsRaw != null && gpsRaw.hasAccuracy()
+                    && gpsRaw.getAccuracy() <= PROBE_MAX_ACC;
+            if (nok) goodStreak++; else goodStreak = 0;
+            if ("ПІДМІНА".equals(nv)) {
+                if (!spoofLatch) {
+                    spoofLatch = true;
+                    Logger.event("TRUST", "підміна виявлена через NMEA: " + spoofFlags);
+                }
+                probeFails++;
+                lastProbeEnd = now;
+            }
+            int tierN = verifierTier();
+            int needN = !spoofLatch ? ALIVE_STREAK
+                    : tierN == 2 ? STREAK_PRECISE
+                    : tierN == 1 ? STREAK_COARSE : STREAK_BLIND;
+            if (nok && goodStreak >= needN && now - lastStateChangeAt >= MIN_DWELL_MS) {
+                Logger.event("NMEA_TRUST", "довіра повернена через NMEA, без проби");
+                gainTrust(now);
+                removeMock();
+                setState(S_GREEN, "GPS впевнений");
+                source = "GPS";
+                precise = false;
+                trackAlt();
+                showFrom(gpsRaw);
+                rememberHold(lat, lon, acc);
+                publish();
+                return;
+            }
+            starvedStreak = 0;
+            String whyN = spoofLatch ? "підміна GPS"
+                    : "ЗАВАДА".equals(nv) ? "завада GNSS"
+                    : "СЛАБКИЙ".equals(nv) ? "слабкий сигнал"
+                    : "GPS під наглядом";
+            installMock();
+            trackAlt();
+            coarseOrPrecise(whyN, now);
+            return;
+        }
+
         if (visible <= STARVED_VIS) starvedStreak++; else starvedStreak = 0;
         boolean starved = starvedStreak >= STARVED_AFTER_S;
         if (starved && !starvedLogged) {
@@ -1090,9 +1184,9 @@ public class FilterService extends Service {
         }
         boolean overdue = !spoofLatch && now - lastProbeEnd >= PROBE_MAX_GAP_MS
                 && now - lastStateChangeAt >= MIN_DWELL_MS;
-        boolean canProbe = overdue || (goodStreak >= ALIVE_STREAK
+        boolean canProbe = !nmeaFresh() && (overdue || (goodStreak >= ALIVE_STREAK
                 && now - lastStateChangeAt >= MIN_DWELL_MS
-                && (!spoofLatch || now - lastProbeEnd >= interval));
+                && (!spoofLatch || now - lastProbeEnd >= interval)));
         if (canProbe) {
             probeTier = tier;
             startProbe(now);
@@ -1111,6 +1205,14 @@ public class FilterService extends Service {
 
         installMock();
         trackAlt();
+        coarseOrPrecise(why, now);
+    }
+
+    /**
+     * Вихід під моком за пріоритетом: точна мережа з екстраполяцією,
+     * груба мережа з передбаченням, утримання, порожній мок.
+     */
+    private void coarseOrPrecise(String why, long now) {
 
         // 1) точна мережа — екстраполяція
         long age = ref == null ? Long.MAX_VALUE : now - refAt;
@@ -1439,9 +1541,11 @@ public class FilterService extends Service {
     private void installMock() {
         boolean wantFused = mockFused && !fusedFailed;
         if (mocked.isEmpty()) {
-            // Під моком слухач бачитиме лише нас; старий фікс більше не актуальний.
+            // Під моком слухач провайдера бачитиме лише нас; старий фікс більше
+            // не актуальний. NMEA, якщо є, наповнить gpsRaw знову за секунду.
             gpsRaw = null;
             prevGps = null;
+            gpsSrc = "—";
         }
         if (mocked.contains(LocationManager.GPS_PROVIDER)
                 && (!wantFused || mocked.contains(FUSED_PROVIDER))) return;
@@ -1691,7 +1795,10 @@ public class FilterService extends Service {
          .append(moving ? 1 : 0).append(',')
          .append(gyroSeen ? f1(heading()) : "").append(',')
          .append(hdgValid ? 1 : 0).append(',')
-         .append(motionSrc);
+         .append(motionSrc).append(',')
+         .append(gpsSrc).append(',')
+         .append(nmeaSats).append(',')
+         .append(nmeaLoc == null ? "" : String.valueOf(SystemClock.elapsedRealtime() - nmeaAt));
         return b.toString();
     }
 
@@ -1807,6 +1914,7 @@ public class FilterService extends Service {
         hasHold = false; probeTier = 2; probeFails = 0;
         cValid = false; cPending = null; cLastRaw = null; lastSpeedAt = 0;
         starvedStreak = 0; starvedLogged = false; netPrev = null; netCur = null;
+        nmeaLoc = null; nmeaAt = 0; nmeaSats = 0; gpsSrc = "—";
         mockDenied = false; mockDeniedAt = 0; mockDeniedBuzzAt = 0;
         usedInFix = 0; visible = 0; towValid = 0;
         divergence = -1; spoofFlags = "—";
@@ -1838,6 +1946,9 @@ public class FilterService extends Service {
         rawYaw = 0; hdgOffset = 0; gyroSeen = false; obdMismatch = 0;
         if (Obd.enabled) Obd.start(this);
 
+        nmeaLoc = null; nmeaAt = 0; nmeaSats = 0; gpsSrc = "—";
+        try { lm.addNmeaListener(nmeaL, h); }
+        catch (Throwable t) { Logger.event("NO_NMEA", t.toString()); }
         try { lm.registerGnssStatusCallback(statusCb, h); }
         catch (Throwable t) { mockError = "status: " + t; }
         try { lm.registerGnssMeasurementsCallback(measCb, h); }
@@ -1882,6 +1993,7 @@ public class FilterService extends Service {
         try { if (sm != null) sm.unregisterListener(accL); } catch (Throwable ignored) { }
         try { if (sm != null) sm.unregisterListener(gyroL); } catch (Throwable ignored) { }
         Obd.stop();
+        try { lm.removeNmeaListener(nmeaL); } catch (Throwable ignored) { }
         try { lm.unregisterGnssStatusCallback(statusCb); } catch (Throwable ignored) { }
         try { lm.unregisterGnssMeasurementsCallback(measCb); } catch (Throwable ignored) { }
         try { lm.removeUpdates(gpsL); } catch (Throwable ignored) { }
