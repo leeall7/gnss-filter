@@ -94,6 +94,22 @@ final class Nmea {
         return true;
     }
 
+    /**
+     * Скільки в реченні GSV супутників із ненульовим SNR. Програмні «мокери»
+     * зазвичай генерують лише GGA/RMC; справжній чіп безперервно сипле GSV із
+     * рівнями сигналу. Це відрізняє апаратний потік від згенерованого.
+     */
+    static int countGsvSnr(String s) {
+        String body = s.indexOf('*') > 0 ? s.substring(0, s.indexOf('*')) : s;
+        String[] f = body.split(",", -1);
+        int n = 0;
+        for (int i = 4; i + 3 < f.length; i += 4) {
+            if (f[i].isEmpty()) continue;
+            try { if (Float.parseFloat(f[i + 3]) > 0) n++; } catch (Throwable ignored) { }
+        }
+        return n;
+    }
+
     /** Оцінка точності з HDOP: UERE ~5 м, межі 3..100 м. */
     static float accuracy(Fix fix) {
         if (fix.hdop <= 0) return 15f;

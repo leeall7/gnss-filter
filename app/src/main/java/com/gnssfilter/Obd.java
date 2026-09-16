@@ -47,14 +47,56 @@ public final class Obd {
     public static volatile String link = "вимкнено";
     public static volatile int reconnects = 0;
 
+    /**
+     * Кільцевий буфер вимірів із мітками часу. ELM327 відповідає із затримкою
+     * 100-400 мс, а NMEA-фікс приходить зі своєю. Зіставляти «останню відому»
+     * швидкість із поточним фіксом некоректно на розгоні й гальмуванні —
+     * беремо той вимір, що ближчий за часом до самого фікса.
+     */
+    private static final int RING = 40;
+    private static final long[] tRing = new long[RING];
+    private static final float[] vRing = new float[RING];
+    private static int ringPos = 0, ringCnt = 0;
+
     private static Thread th;
     private static volatile boolean run = false;
     private static volatile BluetoothSocket sock;
 
     private Obd() { }
 
+    /**
+     * Свіжі дані є лише коли швидкість ДІЙСНА. Лог 16.09: при обриві speedKmh
+     * ставало -1, а speedAt лишався свіжим — фільтр читав «колеса стоять» і
+     * виносив хибний «фальшивий рух» при їзді на 32 км/год.
+     */
+    private static synchronized void push(float kmh, long t) {
+        tRing[ringPos] = t;
+        vRing[ringPos] = kmh;
+        ringPos = (ringPos + 1) % RING;
+        if (ringCnt < RING) ringCnt++;
+    }
+
+    /** Швидкість, виміряна найближче до моменту t. -1, якщо немає в межах tol. */
+    public static synchronized float speedAtMs(long t, long tolMs) {
+        float best = -1f;
+        long bestD = Long.MAX_VALUE;
+        for (int i = 0; i < ringCnt; i++) {
+            long d = Math.abs(tRing[i] - t);
+            if (d < bestD) { bestD = d; best = vRing[i]; }
+        }
+        return bestD <= tolMs ? best : -1f;
+    }
+
+    /** Вік останнього виміру, мс; -1 якщо вимірів немає. */
+    public static long ageMs() {
+        return speedAt > 0 ? SystemClock.elapsedRealtime() - speedAt : -1;
+    }
+
+    public static synchronized void clearRing() { ringCnt = 0; ringPos = 0; }
+
     public static boolean fresh() {
-        return speedAt > 0 && SystemClock.elapsedRealtime() - speedAt < FRESH_MS;
+        return speedKmh >= 0 && speedAt > 0
+                && SystemClock.elapsedRealtime() - speedAt < FRESH_MS;
     }
 
     /** Швидкість у м/с або -1. */
@@ -103,6 +145,7 @@ public final class Obd {
         closeQuiet();
         link = "вимкнено";
         speedKmh = -1f; speedAt = 0;
+        clearRing();
         th = null;
     }
 
@@ -185,7 +228,11 @@ public final class Obd {
                     int v = parseSpeed(r);
                     if (v >= 0) {
                         speedKmh = v;
+                        // Мітка — середина інтервалу «запит-відповідь»: саме там
+                        // ЕБК віддав значення, а не коли ми його дочитали.
+                        long mid = t0 + (SystemClock.elapsedRealtime() - t0) / 2;
                         speedAt = SystemClock.elapsedRealtime();
+                        push(v, mid);
                         misses = 0;
                         link = "з'єднано";
                     } else if (++misses > 8) {
@@ -203,6 +250,8 @@ public final class Obd {
                 closeQuiet();
             }
             speedKmh = -1f;
+            speedAt = 0;          // дані більше не свіжі — жодних «колеса стоять»
+            clearRing();
             sleep(backoff);
             backoff = Math.min(30000, backoff * 2);
         }

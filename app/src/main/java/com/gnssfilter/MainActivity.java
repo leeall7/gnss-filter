@@ -45,7 +45,7 @@ public class MainActivity extends Activity {
     private TextView kAcc, kSpd, kSat, srcLine;
     private TextView obdLine, thLabel, diag, legend;
     private Button btn, diagBtn;
-    private LinearLayout hero, diagBox;
+    private LinearLayout hero, diagBox, mockCard;
     private CheckBox obdBox;
     private boolean diagOpen = false;
     private final Handler h = new Handler(Looper.getMainLooper());
@@ -165,6 +165,35 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         hlp.setMargins(0, 0, 0, dp(10));
         root.addView(hero, hlp);
+
+        // --- попередження про мок-дозвіл (з'являється, лише коли треба) ---
+        mockCard = new LinearLayout(this);
+        mockCard.setOrientation(LinearLayout.VERTICAL);
+        mockCard.setBackground(rounded(0xFFC62828, 14));
+        mockCard.setPadding(dp(14), dp(12), dp(14), dp(12));
+        text(mockCard, "Мок-локацію не дозволено", 16, Color.WHITE, true);
+        text(mockCard, "Developer options → Select mock location app → GNSS Filter.\n"
+                + "Вибір скидається після кожного перевстановлення APK.",
+                13, 0xEEFFFFFF, false);
+        Button devBtn = new Button(this);
+        devBtn.setAllCaps(false);
+        devBtn.setText("Відкрити меню розробника");
+        devBtn.setTextColor(0xFFC62828);
+        devBtn.setBackground(rounded(Color.WHITE, 10));
+        devBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                FilterService.openMockPicker(MainActivity.this);
+            }
+        });
+        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(44));
+        dlp.setMargins(0, dp(8), 0, 0);
+        mockCard.addView(devBtn, dlp);
+        LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        mlp.setMargins(0, 0, 0, dp(10));
+        root.addView(mockCard, mlp);
+        mockCard.setVisibility(View.GONE);
 
         // --- три метрики ---
         LinearLayout row = new LinearLayout(this);
@@ -494,10 +523,14 @@ public class MainActivity extends Activity {
         else o = "OBD: " + Obd.link;
         o += "   рух: " + (FilterService.moving ? "їдемо" : "стоїмо")
                 + " (" + FilterService.motionSrc + ")";
+        if (!FilterService.nmeaTrusted) o += "   NMEA: " + FilterService.nmeaWhy;
         if (FilterService.hdgDeg >= 0)
             o += String.format(Locale.US, "   курс %.0f°%s", FilterService.hdgDeg,
                     FilterService.hdgAbs ? "" : " (відн.)");
         obdLine.setText(o);
+
+        boolean allowed = FilterService.mockAllowed(this);
+        mockCard.setVisibility(allowed && !FilterService.mockDenied ? View.GONE : View.VISIBLE);
 
         if (!hasLocation()) stateWhy.setText("немає дозволу на точну локацію");
         if (run && FilterService.mockDenied) {

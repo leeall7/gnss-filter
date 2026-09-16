@@ -1,6 +1,7 @@
 package com.gnssfilter;
 
 import android.Manifest;
+import android.app.AppOpsManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -77,7 +78,7 @@ import java.util.Map;
  */
 public class FilterService extends Service {
 
-    public static final String VER = "8.0";
+    public static final String VER = "8.2";
     public static final String CH_ID = "gnssfilter";
     public static final int NOTIF_ID = 1;
 
@@ -162,6 +163,15 @@ public class FilterService extends Service {
     // ---- NMEA: справжня позиція чіпа під моком ----
     /** NMEA-фікс, старший за це, не рахуємо. */
     private static final long NMEA_FRESH_MS = 3000;
+    /** Без GSV із рівнями сигналу стільки часу потік вважаємо синтетичним. */
+    private static final long GSV_SILENCE_MS = 60000;
+    /** Петля: NMEA повторює НАШУ видану позицію ближче за це, стільки разів. */
+    private static final float LOOP_TOL_M = 2f;
+    private static final int LOOP_STREAK = 10;
+    /** ...і при цьому наш вихід за цей час пройшов понад стільки метрів. */
+    private static final float LOOP_MIN_PATH_M = 50f;
+    /** Допуск на зіставлення OBD-виміру з моментом GPS-фікса. */
+    private static final long OBD_MATCH_TOL_MS = 1500;
     // ---- статус супутників голодує під моком ----
     /**
      * Note 20 / Android 13: із тестовим провайдером GnssStatus звітує 0-1
@@ -307,11 +317,17 @@ public class FilterService extends Service {
     private long stillSince = 0;
     private int fakeMotion = 0;
     private int obdMismatch = 0;
+    private long obdStillSince = 0;
     private int starvedStreak = 0;
     private boolean starvedLogged = false;
     private final Nmea.Fix nmea = new Nmea.Fix();
     private Location nmeaLoc;
     private long nmeaAt = 0;
+    private long lastGsvAt = 0;
+    private int loopStreak = 0;
+    private double loopFromLat = 0, loopFromLon = 0;
+    public static volatile boolean nmeaTrusted = true;
+    public static volatile String nmeaWhy = "—";
     public static volatile String gpsSrc = "—";     // "fix" (провайдер) або "nmea"
     public static volatile int nmeaSats = 0;
     // два останні мережеві фікси — свідок нерухомості для «фальшивого руху»
@@ -726,6 +742,11 @@ public class FilterService extends Service {
         @Override public void onNmeaMessage(String m, long ts) {
             if (m == null) return;
             String t = Nmea.type(m);
+            if ("GSV".equals(t)) {
+                if (Nmea.checksumOk(m) && Nmea.countGsvSnr(m) > 0)
+                    lastGsvAt = SystemClock.elapsedRealtime();
+                return;
+            }
             if (!"GGA".equals(t) && !"RMC".equals(t)) return;
             if (!Nmea.checksumOk(m)) return;
             boolean pos = "GGA".equals(t) ? Nmea.parseGGA(m, nmea)
@@ -742,6 +763,8 @@ public class FilterService extends Service {
             if (nmea.course >= 0) l.setBearing(nmea.course);
             nmeaLoc = l;
             nmeaAt = SystemClock.elapsedRealtime();
+            checkLoop(l);
+            if (!nmeaTrusted) return;
             if (!mocked.isEmpty()) {          // під моком провайдер мовчить
                 prevGps = gpsRaw;
                 gpsRaw = l;
@@ -751,8 +774,41 @@ public class FilterService extends Service {
         }
     };
 
+    /**
+     * Захист від петлі: на деяких прошивках (особливо магнітол) система може
+     * транслювати НАШІ ж мок-координати назад у вигляді NMEA. Тоді фільтр
+     * перевіряв би сам себе. Ознака: NMEA повторює нашу видану позицію з
+     * точністю до метрів, поки ця позиція відчутно рухається.
+     */
+    private void checkLoop(Location l) {
+        if (mocked.isEmpty() || !emitted) { loopStreak = 0; return; }
+        float[] r = new float[1];
+        Location.distanceBetween(l.getLatitude(), l.getLongitude(), emLat, emLon, r);
+        if (r[0] > LOOP_TOL_M) { loopStreak = 0; return; }
+        if (loopStreak == 0) { loopFromLat = emLat; loopFromLon = emLon; }
+        loopStreak++;
+        if (loopStreak < LOOP_STREAK) return;
+        Location.distanceBetween(loopFromLat, loopFromLon, emLat, emLon, r);
+        if (r[0] < LOOP_MIN_PATH_M) return;   // стояли — збіг міг бути випадковим
+        if (nmeaTrusted) {
+            nmeaTrusted = false;
+            nmeaWhy = "петля: NMEA повторює наш мок";
+            Logger.event("NMEA_LOOP", nmeaWhy);
+        }
+    }
+
+    /** NMEA придатний, якщо свіжий, не в петлі й підтверджений живими GSV. */
     private boolean nmeaFresh() {
-        return nmeaLoc != null && SystemClock.elapsedRealtime() - nmeaAt <= NMEA_FRESH_MS;
+        if (nmeaLoc == null || !nmeaTrusted) return false;
+        long now = SystemClock.elapsedRealtime();
+        if (now - nmeaAt > NMEA_FRESH_MS) return false;
+        if (lastGsvAt > 0 && now - lastGsvAt > GSV_SILENCE_MS) {
+            nmeaTrusted = false;
+            nmeaWhy = "GSV замовкли — потік схожий на синтетичний";
+            Logger.event("NMEA_SYNTH", nmeaWhy);
+            return false;
+        }
+        return true;
     }
 
     private final LocationListener gpsL = listener(0);
@@ -838,7 +894,15 @@ public class FilterService extends Service {
         // Тиша акселерометра САМА ПО СОБІ не голосує: лог 15.09 — три хибні
         // вироки при плавній їзді на 36 км/год (розкид 0,1 при порозі 0,15).
         boolean obd = Obd.fresh();
-        boolean obdStill = obd && Obd.speedKmh < OBD_STILL_KMH;
+        // Рушання з місця: колеса вже 1 км/год, а GPS уже бачить рух. Тому
+        // «колеса стоять» має протриматись кілька секунд, перш ніж голосувати.
+        if (obd && Obd.speedKmh < OBD_STILL_KMH) {
+            if (obdStillSince == 0) obdStillSince = now;
+        } else {
+            obdStillSince = 0;
+        }
+        boolean obdStill = obdStillSince > 0
+                && now - obdStillSince >= FAKE_MOTION_VOTE_S * 1000L;
         boolean accelStill = stillSince > 0 && now - stillSince >= FAKE_MOTION_VOTE_S * 1000L;
         boolean witness = obdStill || (accelStill && netStill(now));
         if (witness && g.hasSpeed() && g.getSpeed() > FAKE_MOTION_SPEED) {
@@ -852,7 +916,11 @@ public class FilterService extends Service {
 
         // --- розбіжність швидкостей GPS і OBD: спуфер веде не з нашою швидкістю ---
         if (obd && g.hasSpeed()) {
-            float gk = g.getSpeed() * 3.6f, ok = Obd.speedKmh;
+            // Беремо той вимір OBD, що найближчий за часом до самого фікса:
+            // ELM327 відповідає із затримкою, і на розгоні різниця уявна.
+            long fixMs = g.getElapsedRealtimeNanos() / 1000000L;
+            float atFix = Obd.speedAtMs(fixMs, OBD_MATCH_TOL_MS);
+            float gk = g.getSpeed() * 3.6f, ok = atFix >= 0 ? atFix : Obd.speedKmh;
             float tol = Math.max(OBD_MISMATCH_KMH, OBD_MISMATCH_FRAC * Math.max(gk, ok));
             if (Math.abs(gk - ok) > tol) {
                 obdMismatch++;
@@ -1796,6 +1864,9 @@ public class FilterService extends Service {
          .append(gyroSeen ? f1(heading()) : "").append(',')
          .append(hdgValid ? 1 : 0).append(',')
          .append(motionSrc).append(',')
+         .append(f1(speedMps * 3.6f)).append(',')
+         .append(Obd.ageMs()).append(',')
+         .append(nmeaTrusted ? 1 : 0).append(',')
          .append(gpsSrc).append(',')
          .append(nmeaSats).append(',')
          .append(nmeaLoc == null ? "" : String.valueOf(SystemClock.elapsedRealtime() - nmeaAt));
@@ -1856,6 +1927,38 @@ public class FilterService extends Service {
                 == PackageManager.PERMISSION_GRANTED;
     }
 
+    /**
+     * Чи обрано нас застосунком для мок-локації. Дізнаємось ДО старту, а не
+     * за SecurityException після. Якщо перевірка недоступна — не лякаємо.
+     */
+    public static boolean mockAllowed(Context c) {
+        try {
+            AppOpsManager ao = (AppOpsManager) c.getSystemService(Context.APP_OPS_SERVICE);
+            if (ao == null) return true;
+            return ao.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_MOCK_LOCATION,
+                    android.os.Process.myUid(), c.getPackageName())
+                    == AppOpsManager.MODE_ALLOWED;
+        } catch (Throwable t) { return true; }
+    }
+
+    /** Меню розробника з підсвіткою пункту вибору мок-застосунку. */
+    public static void openMockPicker(Context c) {
+        try {
+            Intent i = new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS);
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            i.putExtra(":settings:fragment_args_key", "mock_location_app");
+            android.os.Bundle b = new android.os.Bundle();
+            b.putString(":settings:fragment_args_key", "mock_location_app");
+            i.putExtra(":settings:show_fragment_args", b);
+            c.startActivity(i);
+        } catch (Throwable t) {
+            try {
+                c.startActivity(new Intent(Settings.ACTION_SETTINGS)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            } catch (Throwable ignored) { }
+        }
+    }
+
     public static Intent overlaySettings(Context c) {
         return new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                 Uri.parse("package:" + c.getPackageName()));
@@ -1880,6 +1983,11 @@ public class FilterService extends Service {
             return START_NOT_STICKY;
         }
 
+        if (!mockAllowed(this)) {
+            mockDenied = true;
+            mockError = "МОК ЗАБОРОНЕНО: Developer options → Select mock location app";
+            Logger.event("MOCK_DENIED", "перевірка AppOps до старту");
+        }
         state = S_WARMUP;
         reason = "прогрів";
         try {
@@ -1914,6 +2022,8 @@ public class FilterService extends Service {
         hasHold = false; probeTier = 2; probeFails = 0;
         cValid = false; cPending = null; cLastRaw = null; lastSpeedAt = 0;
         starvedStreak = 0; starvedLogged = false; netPrev = null; netCur = null;
+        obdStillSince = 0; lastGsvAt = 0; loopStreak = 0;
+        nmeaTrusted = true; nmeaWhy = "—";
         nmeaLoc = null; nmeaAt = 0; nmeaSats = 0; gpsSrc = "—";
         mockDenied = false; mockDeniedAt = 0; mockDeniedBuzzAt = 0;
         usedInFix = 0; visible = 0; towValid = 0;
