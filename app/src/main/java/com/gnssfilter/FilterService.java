@@ -78,7 +78,7 @@ import java.util.Map;
  */
 public class FilterService extends Service {
 
-    public static final String VER = "9.0";
+    public static final String VER = "9.1";
     public static final String CH_ID = "gnssfilter";
     public static final int NOTIF_ID = 1;
 
@@ -907,7 +907,7 @@ public class FilterService extends Service {
         }
 
         List<String> f = new ArrayList<>();
-        boolean crit = false, anchored = false;
+        boolean crit = false, anchored = false, confirmed = false;
 
         // --- зона мережі ---
         Location nl = netRaw;
@@ -924,6 +924,8 @@ public class FilterService extends Service {
             if (d > zone) {
                 f.add("поза_зоною");
                 if (d > Math.max(2 * zone, ZONE_CRIT_MIN)) crit = true;
+            } else if (a <= NET_PRECISE_ACC && d <= zone / 2) {
+                confirmed = true;   // мережа прямо підтверджує позицію GPS
             }
         }
 
@@ -994,6 +996,14 @@ public class FilterService extends Service {
         lastCrit = crit;
 
         if (crit) return "ПІДМІНА";
+        // Якщо ТОЧНА мережа підтверджує позицію GPS, другорядні ознаки —
+        // вироджені азимути, розбіжність часу, стрибок — вироку не виносять.
+        // Лог 17.09, 22:48:06 і 22:49:36: «час+азимут0» дали «підміну» при
+        // розходженні з мережею всього 24-30 м, тобто при повній згоді.
+        // Якір на те й якір: він тут головний свідок, а не непрямі ознаки.
+        if (confirmed && !f.contains("фальш_рух")) {
+            return "";
+        }
         if (votes >= 2) return "ПІДМІНА";
         // Мережа — якір: вихід за її зону сам по собі вирок (через серію DEAD_STREAK).
         // Фальшивий рух — теж: це прямий фізичний доказ.
@@ -1164,8 +1174,27 @@ public class FilterService extends Service {
             if ("ПІДМІНА".equals(verdict)) {
                 if (!spoofLatch) spoofLatch = true;
                 endProbe("підміна: " + spoofFlags, now);
-            } else if (!ok) {
+            } else if (!ok && !"СЛАБКИЙ".equals(verdict) && !"ЗАВАДА".equals(verdict)
+                    && !"НЕМАЄ_ФІКСА".equals(verdict)) {
                 endProbe(verdict, now);
+            } else if (!ok) {
+                // Приймач під моком дрімає: після зняття йому потрібні секунди,
+                // щоб видати фікс. Лог 17.09: усі п'ять проб уривались за 1 с
+                // із «СЛАБКИЙ», і застосунок не виходив із помаранчевого
+                // три хвилини при чистому небі. Тримаємо вікно проби.
+                long maxW = (spoofLatch && probeTier == 0) ? PROBE_MAX_BLIND_MS
+                        : spoofLatch && probeTier == 1 ? PROBE_MAX_COARSE_MS : PROBE_MAX_MS;
+                if (now - probeStart > maxW) {
+                    endProbe(verdict, now);
+                } else {
+                    setState(S_YELLOW, "проба GPS: приймач прокидається");
+                    source = "GPS";
+                    precise = false;
+                    trackAlt();
+                    showFrom(gpsRaw);
+                    publish();
+                    return;
+                }
             } else if (!haveFix && now - probeStart > PROBE_MAX_MS) {
                 endProbe("фікс не прийшов", now);
             } else if (!haveFix) {
@@ -1265,7 +1294,11 @@ public class FilterService extends Service {
             return;
         }
 
-        if (visible <= STARVED_VIS) starvedStreak++; else starvedStreak = 0;
+        // Голодування ширше, ніж «видимих нуль»: лог 17.09 показав 25-45
+        // видимих супутників при usedInFix 0-2 і нормальному AGC — тобто
+        // прапорець «у розв'язку» під моком просто не оновлюється.
+        boolean statusDead = usedInFix < MIN_USED && visible >= 8 && !agcAlarm();
+        if (visible <= STARVED_VIS || statusDead) starvedStreak++; else starvedStreak = 0;
         boolean starved = starvedStreak >= STARVED_AFTER_S;
         if (starved && !starvedLogged) {
             starvedLogged = true;
