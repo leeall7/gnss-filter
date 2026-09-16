@@ -40,10 +40,32 @@ jobs:
         with:
           gradle-version: '8.11.1'
 
+      - name: Ключ підпису
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::warning::KEYSTORE_B64 не заданий — APK буде з тимчасовим ключем"
+            exit 0
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/gnss.jks"
+          ls -l "$RUNNER_TEMP/gnss.jks"
+
       - name: Build debug APK
+        env:
+          KEYSTORE_FILE: ${{ runner.temp }}/gnss.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -o pipefail
           gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - name: Перевірка підпису
+        run: |
+          APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
+          "$ANDROID_HOME"/build-tools/35.0.0/apksigner verify --print-certs "$APK" \
+            | grep -i "Signer #1 certificate SHA-256" || echo "не вдалось прочитати підпис"
 
       - name: Причина падіння
         if: failure()
