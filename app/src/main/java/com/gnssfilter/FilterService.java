@@ -78,7 +78,7 @@ import java.util.Map;
  */
 public class FilterService extends Service {
 
-    public static final String VER = "9.1";
+    public static final String VER = "9.2";
     public static final String CH_ID = "gnssfilter";
     public static final int NOTIF_ID = 1;
 
@@ -160,6 +160,14 @@ public class FilterService extends Service {
     private static final int STREAK_PRECISE = 20, STREAK_COARSE = 40, STREAK_BLIND = 60;
     private static final long PROBE_MAX_MS = 25000, PROBE_MAX_COARSE_MS = 50000,
             PROBE_MAX_BLIND_MS = 75000;
+    /**
+     * Мінімальна пауза між пробами — ЗАВЖДИ, не лише під латчем. Без неї
+     * «мертвий статус» відкривав пробу щоп'ять секунд, і на Note 20 мок був
+     * знятий 86% часу (прогін логів 15.09). Кожна невдала проба подвоює паузу.
+     */
+    private static final long PROBE_MIN_GAP_MS = 30000;
+    /** Скільки чекаємо, поки приймач прокинеться, якщо він не подає ознак життя. */
+    private static final long PROBE_WAKE_MS = 12000;
     // ---- NMEA: справжня позиція чіпа під моком ----
     /** NMEA-фікс, старший за це, не рахуємо. */
     private static final long NMEA_FRESH_MS = 3000;
@@ -1072,8 +1080,8 @@ public class FilterService extends Service {
         probing = false;
         lastProbeEnd = now;
         goodStreak = 0;
-        if (why.startsWith("підміна")) probeFails++;
-        else if (probeFails > 0) probeFails--;   // не підміна — спуфер міг зникнути
+        // Будь-яка проба, що не повернула довіру, рахується невдалою: пауза росте.
+        probeFails++;
         Logger.event("PROBE_END", why + " (невдач поспіль: " + probeFails + ")");
         installMock();
     }
@@ -1182,8 +1190,8 @@ public class FilterService extends Service {
                 // щоб видати фікс. Лог 17.09: усі п'ять проб уривались за 1 с
                 // із «СЛАБКИЙ», і застосунок не виходив із помаранчевого
                 // три хвилини при чистому небі. Тримаємо вікно проби.
-                long maxW = (spoofLatch && probeTier == 0) ? PROBE_MAX_BLIND_MS
-                        : spoofLatch && probeTier == 1 ? PROBE_MAX_COARSE_MS : PROBE_MAX_MS;
+                // Приймач без ознак життя довго тримати не варто.
+                long maxW = PROBE_WAKE_MS;
                 if (now - probeStart > maxW) {
                     endProbe(verdict, now);
                 } else {
@@ -1319,16 +1327,16 @@ public class FilterService extends Service {
         int tier = verifierTier();
         long interval = tier == 2 ? PROBE_INT_PRECISE_MS
                 : tier == 1 ? PROBE_INT_COARSE_MS : PROBE_INT_BLIND_MS;
-        if (probeFails >= PROBE_BACKOFF_AFTER) {
-            // Спуфер тримається — не смикаємо мок щодвадцять секунд даремно.
-            long grown = interval * (1L << Math.min(4, probeFails - PROBE_BACKOFF_AFTER + 1));
-            interval = Math.min(PROBE_INT_MAX_MS, grown);
-        }
+        // Кожна невдала проба подвоює паузу: приймач, що не прокидається,
+        // не має права тримати мок знятим.
+        long gap = Math.max(spoofLatch ? interval : PROBE_MIN_GAP_MS, PROBE_MIN_GAP_MS);
+        if (probeFails > 0)
+            gap = Math.min(PROBE_INT_MAX_MS, gap * (1L << Math.min(3, probeFails)));
+        boolean cooled = now - lastProbeEnd >= gap;
         boolean overdue = !spoofLatch && now - lastProbeEnd >= PROBE_MAX_GAP_MS
                 && now - lastStateChangeAt >= MIN_DWELL_MS;
-        boolean canProbe = !nmeaFresh() && (overdue || (goodStreak >= ALIVE_STREAK
-                && now - lastStateChangeAt >= MIN_DWELL_MS
-                && (!spoofLatch || now - lastProbeEnd >= interval)));
+        boolean canProbe = !nmeaFresh() && cooled && (overdue
+                || (goodStreak >= ALIVE_STREAK && now - lastStateChangeAt >= MIN_DWELL_MS));
         if (canProbe) {
             probeTier = tier;
             startProbe(now);
