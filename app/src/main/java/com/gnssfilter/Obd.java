@@ -35,6 +35,16 @@ public final class Obd {
 
     private static final UUID SPP = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     private static final long POLL_MS = 250;
+    /**
+     * Лог 16.09: перші сесії тримались 471 і 460 с без жодного обриву, а після
+     * перезапуску служби почався рваний цикл «20-26 с — обрив». Причина не в
+     * адаптері: (1) будь-який збій читання рвав сокет, хоча клони ELM327
+     * регулярно гублять одну відповідь; (2) ATZ на кожному перепідключенні —
+     * апаратне скидання, яке саме по собі дестабілізує; (3) підключались
+     * одразу після закриття, поки адаптер не звільнив RFCOMM-канал.
+     */
+    private static final int READ_RETRIES = 3;
+    private static final long COOLDOWN_MS = 2000;
     private static final long FRESH_MS = 2000;
     private static final String[] NAME_HINTS =
             { "OBD", "ELM", "V-LINK", "VLINK", "VGATE", "ICAR", "VEEPEAK", "KONNWEI", "CAR" };
@@ -53,6 +63,12 @@ public final class Obd {
      * швидкість із поточним фіксом некоректно на розгоні й гальмуванні —
      * беремо той вимір, що ближчий за часом до самого фікса.
      */
+    /**
+     * Буфер має власний замок, а не монітор класу: інакше читання з головного
+     * потоку (speedAtMs у вердикті) могло б чекати на start/stop, які торкаються
+     * сокета. Тепер головний потік не блокується ніколи.
+     */
+    private static final Object RING_LOCK = new Object();
     private static final int RING = 40;
     private static final long[] tRing = new long[RING];
     private static final float[] vRing = new float[RING];
@@ -61,6 +77,8 @@ public final class Obd {
     private static Thread th;
     private static volatile boolean run = false;
     private static volatile BluetoothSocket sock;
+    private static volatile long lastCloseAt = 0;
+    private static volatile boolean everConnected = false;
 
     private Obd() { }
 
@@ -69,22 +87,26 @@ public final class Obd {
      * ставало -1, а speedAt лишався свіжим — фільтр читав «колеса стоять» і
      * виносив хибний «фальшивий рух» при їзді на 32 км/год.
      */
-    private static synchronized void push(float kmh, long t) {
-        tRing[ringPos] = t;
-        vRing[ringPos] = kmh;
-        ringPos = (ringPos + 1) % RING;
-        if (ringCnt < RING) ringCnt++;
+    private static void push(float kmh, long t) {
+        synchronized (RING_LOCK) {
+            tRing[ringPos] = t;
+            vRing[ringPos] = kmh;
+            ringPos = (ringPos + 1) % RING;
+            if (ringCnt < RING) ringCnt++;
+        }
     }
 
     /** Швидкість, виміряна найближче до моменту t. -1, якщо немає в межах tol. */
-    public static synchronized float speedAtMs(long t, long tolMs) {
-        float best = -1f;
-        long bestD = Long.MAX_VALUE;
-        for (int i = 0; i < ringCnt; i++) {
-            long d = Math.abs(tRing[i] - t);
-            if (d < bestD) { bestD = d; best = vRing[i]; }
+    public static float speedAtMs(long t, long tolMs) {
+        synchronized (RING_LOCK) {
+            float best = -1f;
+            long bestD = Long.MAX_VALUE;
+            for (int i = 0; i < ringCnt; i++) {
+                long d = Math.abs(tRing[i] - t);
+                if (d < bestD) { bestD = d; best = vRing[i]; }
+            }
+            return bestD <= tolMs ? best : -1f;
         }
-        return bestD <= tolMs ? best : -1f;
     }
 
     /** Вік останнього виміру, мс; -1 якщо вимірів немає. */
@@ -92,7 +114,9 @@ public final class Obd {
         return speedAt > 0 ? SystemClock.elapsedRealtime() - speedAt : -1;
     }
 
-    public static synchronized void clearRing() { ringCnt = 0; ringPos = 0; }
+    public static void clearRing() {
+        synchronized (RING_LOCK) { ringCnt = 0; ringPos = 0; }
+    }
 
     public static boolean fresh() {
         return speedKmh >= 0 && speedAt > 0
@@ -142,7 +166,19 @@ public final class Obd {
 
     public static synchronized void stop() {
         run = false;
-        closeQuiet();
+        // Закриття сокета може заблокувати виклик — головний потік цього не робить.
+        final BluetoothSocket s = sock;
+        sock = null;
+        if (s != null) {
+            Thread t = new Thread(new Runnable() {
+                @Override public void run() {
+                    try { s.close(); } catch (Throwable ignored) { }
+                }
+            }, "obd-close");
+            t.setDaemon(true);
+            t.start();
+        }
+        lastCloseAt = SystemClock.elapsedRealtime();
         link = "вимкнено";
         speedKmh = -1f; speedAt = 0;
         clearRing();
@@ -187,6 +223,11 @@ public final class Obd {
                 sleep(5000);
                 continue;
             }
+            // Витримка після закриття: адаптер має звільнити RFCOMM-канал,
+            // інакше наступне підключення сиплеться «Broken pipe».
+            long since = SystemClock.elapsedRealtime() - lastCloseAt;
+            if (lastCloseAt > 0 && since < COOLDOWN_MS) sleep(COOLDOWN_MS - since);
+
             BluetoothDevice dev = pick(c, ad);
             if (dev == null) {
                 link = "адаптер не знайдено серед спарених";
@@ -211,7 +252,9 @@ public final class Obd {
                 OutputStream os = s.getOutputStream();
 
                 link = "ініціалізація";
-                cmd(os, in, "ATZ", 3000);
+                // ATZ — тільки при першому підключенні. На перепідключенні
+                // адаптер уже налаштований, а скидання лише дестабілізує.
+                if (!everConnected) cmd(os, in, "ATZ", 3000);
                 cmd(os, in, "ATE0", 1500);   // без луни
                 cmd(os, in, "ATL0", 1500);   // без переведення рядка
                 cmd(os, in, "ATS0", 1500);   // без пробілів
@@ -220,11 +263,22 @@ public final class Obd {
                 cmd(os, in, "0100", 6000);   // перший запит будить ЕБК і обирає протокол
 
                 link = "з'єднано";
+                everConnected = true;
                 backoff = 2000;
-                int misses = 0;
+                int misses = 0, readFails = 0;
                 while (run) {
                     long t0 = SystemClock.elapsedRealtime();
-                    String r = cmd(os, in, "010D", 1500);
+                    String r;
+                    try {
+                        r = cmd(os, in, "010D", 1500);
+                        readFails = 0;
+                    } catch (Throwable readErr) {
+                        // Поодинокий збій читання — не привід рвати з'єднання.
+                        if (++readFails >= READ_RETRIES) throw readErr;
+                        link = "збій читання " + readFails + "/" + READ_RETRIES;
+                        sleep(200);
+                        continue;
+                    }
                     int v = parseSpeed(r);
                     if (v >= 0) {
                         speedKmh = v;
@@ -248,6 +302,7 @@ public final class Obd {
                 reconnects++;
             } finally {
                 closeQuiet();
+                lastCloseAt = SystemClock.elapsedRealtime();
             }
             speedKmh = -1f;
             speedAt = 0;          // дані більше не свіжі — жодних «колеса стоять»

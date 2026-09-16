@@ -78,7 +78,7 @@ import java.util.Map;
  */
 public class FilterService extends Service {
 
-    public static final String VER = "8.2";
+    public static final String VER = "9.0";
     public static final String CH_ID = "gnssfilter";
     public static final int NOTIF_ID = 1;
 
@@ -193,7 +193,16 @@ public class FilterService extends Service {
     // ---- фальшивий рух: акселерометр каже «стоїмо», GPS каже «їдемо» ----
     private static final int FAKE_MOTION_VOTE_S = 5;
     private static final int FAKE_MOTION_CRIT_S = 10;
-    private static final float FAKE_MOTION_SPEED = 2f;
+    /**
+     * Лог 16.09, 18:06:51: машина рушала, GPS чесно показав 8 км/год, а
+     * акселерометр ще не перетнув поріг і мережевий фікс не оновився — вийшов
+     * хибний вирок «підміна» на 21 секунду. Поріг піднято з 2 до 5 м/с (18
+     * км/год): на рушанні це ще неоднозначно, а спуфер «везе» помітно швидше.
+     */
+    private static final float FAKE_MOTION_SPEED = 5f;
+    /** Скільки секунд суперечність має протриматись, перш ніж стати голосом. */
+    private static final int FAKE_MOTION_FLAG_S = 5;
+    private static final int FAKE_MOTION_FLAG_OBD_S = 3;
     // ---- OBD: швидкість з коліс проти швидкості GPS ----
     /** Розбіжність GPS і OBD, яку вважаємо значущою: більше з двох. */
     private static final float OBD_MISMATCH_KMH = 15f;
@@ -204,6 +213,23 @@ public class FilterService extends Service {
     // ---- гіроскоп: курс між мережевими фіксами ----
     /** Наскільки мережевий вектор підправляє курс гіроскопа (дрейф ~1°/хв). */
     private static final double HDG_NET_BLEND = 0.2;
+    // ---- опорні точки: числення від того, чому ми вірили ----
+    /**
+     * Опорою стає лише ДОСТАТНЬО ТОЧНА точка: довірений GPS або мережа,
+     * краща за це. Гірші фікси не тягнуть позицію взагалі — саме вони
+     * перекидали нас на сотні метрів (лог 16.09: 20 стрибків понад 200 м).
+     */
+    private static final float ANCHOR_ACC_M = 60f;
+    /** Скільки метрів шляху додає до невизначеності кожен метр числення. */
+    private static final float DR_SCALE_OBD = 0.02f;    // колеса: 1-2%
+    private static final float DR_SCALE_NOSPD = 0.30f;  // швидкість з опор: ~30%
+    /** Дрейф курсу гіроскопа, градусів за секунду. */
+    private static final float DR_HDG_DRIFT_DPS = 0.02f;
+    /** Числення без нової опори довше за це — визнаємо, що загубились. */
+    private static final long DR_MAX_MS = 120000;
+    /** Мережа наполегливо не сходиться стільки разів — перезапуск опори. */
+    private static final int DR_DISAGREE = 4;
+
     // ---- груба мережа: фікс — слабка прив'язка, рух між фіксами — наш ----
     /** Стрибок понад стільки сумарних сигм — підозрілий, чекає підтвердження. */
     private static final float COARSE_GATE_SIG = 3f;
@@ -318,6 +344,17 @@ public class FilterService extends Service {
     private int fakeMotion = 0;
     private int obdMismatch = 0;
     private long obdStillSince = 0;
+    private long lastEmitWall = 0;
+    // опора числення
+    private double drLat = 0, drLon = 0;
+    private float drSig = 0;
+    private boolean drValid = false;
+    private long drAt = 0, drAnchorAt = 0;
+    private float drSpeed = 0;          // м/с, остання оцінка
+    private int drDisagree = 0;
+    private Location drLastAnchor;
+    public static volatile String drSrc = "—";
+    public static volatile float drSig0 = 0;
     private int starvedStreak = 0;
     private boolean starvedLogged = false;
     private final Nmea.Fix nmea = new Nmea.Fix();
@@ -695,7 +732,7 @@ public class FilterService extends Service {
      */
     private boolean netStill(long now) {
         if (netCur == null || netPrev == null) return false;
-        if (now - netCurAt > 15000) return false;
+        if (now - netCurAt > 10000) return false;   // свідок має бути свіжим
         if (netCurAt - netPrevAt < 5000) return false;
         float tol = Math.max(30f, Math.max(netCur.hasAccuracy() ? netCur.getAccuracy() : 30f,
                 netPrev.hasAccuracy() ? netPrev.getAccuracy() : 30f));
@@ -907,7 +944,9 @@ public class FilterService extends Service {
         boolean witness = obdStill || (accelStill && netStill(now));
         if (witness && g.hasSpeed() && g.getSpeed() > FAKE_MOTION_SPEED) {
             fakeMotion++;
-            f.add(obdStill ? "фальш_рух_OBD" : "фальш_рух");
+            // Голос лише після стійкої суперечності, а не з першої секунди.
+            if (fakeMotion >= (obdStill ? FAKE_MOTION_FLAG_OBD_S : FAKE_MOTION_FLAG_S))
+                f.add(obdStill ? "фальш_рух_OBD" : "фальш_рух");
             // З OBD доказ прямий: колеса не крутяться — вирок удвічі швидше.
             if (fakeMotion >= (obdStill ? FAKE_MOTION_VOTE_S : FAKE_MOTION_CRIT_S)) crit = true;
         } else {
@@ -1101,7 +1140,9 @@ public class FilterService extends Service {
                 if (gg != null && gg.hasSpeed()) {
                     lastSpeed = gg.getSpeed();
                     lastSpeedAt = now;
+                    drSpeed = gg.getSpeed();
                 }
+                if (anchorGrade(gg)) setAnchor(gg, "GPS", now);   // найкраща опора
                 cValid = false;                     // груба оцінка стартує заново з GPS
                 source = "GPS";
                 emitted = false;
@@ -1296,12 +1337,54 @@ public class FilterService extends Service {
         }
         precise = false;
 
-        // 2) груба мережа — фікс лише слабка прив'язка; рух між фіксами рахуємо самі.
-        //    Лог 14.09: сирі грубі фікси стрибали в медіані на 717 м, кожен
-        //    десятий понад 5 км — віддавати їх напряму означало телепортацію.
+        // 2) числення від останньої ДОСТАТНЬО ТОЧНОЇ опори.
         Location nl = netRaw;
-        if (nl != null && nl.hasAccuracy() && ageMs(nl) <= MAX_NET_AGE_MS
-                && nl.getAccuracy() <= NET_ANCHOR_MAX_ACC) {
+        boolean netFresh = nl != null && nl.hasAccuracy() && ageMs(nl) <= MAX_NET_AGE_MS;
+
+        if (netFresh && anchorGrade(nl) && nl != drLastAnchor) {
+            setAnchor(nl, "network", now);      // нова опора — скидає похибку
+        } else if (drValid) {
+            deadReckon(now);
+            if (netFresh && nl != drLastAnchor) {
+                // Груба мережа опорою не стає, але стежить, чи ми не загубились.
+                float[] rr = new float[1];
+                Location.distanceBetween(drLat, drLon, nl.getLatitude(), nl.getLongitude(), rr);
+                if (rr[0] > 3 * (drSig + nl.getAccuracy())) drDisagree++;
+                else drDisagree = 0;
+                // Перезапуск опори лише КРЕДИТОСПРОМОЖНИМ фіксом: той, що гірший
+                // за нашу накопичену невизначеність, спростувати нас не може.
+                // Інакше фікс із похибкою 800 м перекидав би нас на кілометри —
+                // рівно той дефект, який ця схема мала прибрати.
+                boolean credible = nl.getAccuracy() <= Math.max(ANCHOR_ACC_M, drSig);
+                if (drDisagree >= DR_DISAGREE && credible) {
+                    Logger.event("DR_RESET", String.format(Locale.US,
+                            "числення розійшлось із мережею на %.0f м (фікс ±%.0f)",
+                            rr[0], nl.getAccuracy()));
+                    setAnchor(nl, "network(скид)", now);
+                }
+            }
+            if (now - drAnchorAt > DR_MAX_MS) {
+                drValid = false;
+                drSrc = "—";
+                Logger.event("DR_LOST", "числення без опори понад "
+                        + (DR_MAX_MS / 1000) + " с");
+            }
+        }
+
+        if (drValid) {
+            setState(S_ORANGE, why + (Obd.fresh() ? ", числення (OBD)" : ", числення"));
+            source = drSrc;
+            extrapMs = now - drAnchorAt;
+            float sp = Obd.fresh() ? Math.max(0f, Obd.speedMps()) : (moving ? drSpeed : 0f);
+            boolean mv = moving && sp > MIN_MOVE_MPS;
+            emit(drLat, drLon, drSig, mv ? sp : 0, (mv && hdgValid) ? (float) heading() : -1);
+            rememberHold(lat, lon, acc);
+            publish();
+            return;
+        }
+
+        // 2б) опори немає взагалі — грубий фікс краще, ніж нічого
+        if (netFresh && nl.getAccuracy() <= NET_ANCHOR_MAX_ACC) {
             setState(S_ORANGE, why + ", груба мережа");
             source = "network";
             coarseStep(nl, now);
@@ -1402,6 +1485,61 @@ public class FilterService extends Service {
         boolean mv = sp > MIN_MOVE_MPS;
         emit(cLat, cLon, rad, mv ? sp : 0, (mv && hdgValid) ? (float) heading() : -1);
         rememberHold(lat, lon, acc);
+    }
+
+    /** Чи достатньо точна точка, щоб стати опорою. */
+    private static boolean anchorGrade(Location l) {
+        return l != null && l.hasAccuracy() && l.getAccuracy() <= ANCHOR_ACC_M;
+    }
+
+    /** Нова опора: скидаємо накопичену невизначеність до точності самої точки. */
+    private void setAnchor(Location l, String src, long now) {
+        if (drValid && drLastAnchor != null) {
+            long dt = now - drAnchorAt;
+            float d = drLastAnchor.distanceTo(l);
+            if (dt > 1000 && dt < 120000) {
+                float v = d / (dt / 1000f);
+                // Масштаб уточнюємо заднім числом: пройшли стільки за стільки.
+                if (v <= MAX_SPEED_MPS) drSpeed = v;
+            }
+        }
+        drLat = l.getLatitude();
+        drLon = l.getLongitude();
+        drSig = l.getAccuracy();
+        drSig0 = drSig;
+        drValid = true;
+        drAt = now;
+        drAnchorAt = now;
+        drDisagree = 0;
+        drLastAnchor = new Location(l);
+        drSrc = src;
+    }
+
+    /**
+     * Крок числення: від опори рухаємось за швидкістю й курсом, невизначеність
+     * росте. Фікси, гірші за ANCHOR_ACC_M, опорою не стають — вони лише
+     * перевіряють, чи ми не загубились.
+     */
+    private void deadReckon(long now) {
+        double dt = (now - drAt) / 1000.0;
+        drAt = now;
+        if (dt <= 0 || dt > 5) return;
+
+        float sp = Obd.fresh() ? Math.max(0f, Obd.speedMps()) : (moving ? drSpeed : 0f);
+        if (!moving) sp = 0f;
+
+        if (sp > MIN_MOVE_MPS && hdgValid) {
+            double r = Math.toRadians(heading());
+            drLat += (Math.cos(r) * sp * dt) / M_PER_DEG;
+            double k = M_PER_DEG * Math.cos(Math.toRadians(drLat));
+            if (Math.abs(k) > 1) drLon += (Math.sin(r) * sp * dt) / k;
+        }
+
+        // Невизначеність: частка пройденого шляху плюс бічний знос від дрейфу курсу.
+        double path = sp * dt;
+        float scale = Obd.fresh() ? DR_SCALE_OBD : DR_SCALE_NOSPD;
+        double drift = Math.toRadians(DR_HDG_DRIFT_DPS * (now - drAnchorAt) / 1000.0);
+        drSig += (float) (path * scale + Math.abs(path * Math.sin(drift)) + 0.5 * dt);
     }
 
     /** Остання позиція, в яку ми вірили. Основа утримання без мережі. */
@@ -1574,12 +1712,22 @@ public class FilterService extends Service {
         emLat = la; emLon = lo; emAcc = a; emSpd = sp; emBrg = br;
         emitted = true;
         lat = la; lon = lo; acc = a; speedMps = sp; bearingDeg = br;
+        // Мітки часу ставимо БЕЗПОСЕРЕДНЬО перед записом у провайдер, і стінний
+        // час робимо строго зростаючим: стрибок системного годинника назад
+        // навігатори читають як «застарілий фікс» і показують пошук сигналу.
+        long wall = System.currentTimeMillis();
+        // Монотонність лише проти ДРІБНИХ стрибків назад (NTP-корекція).
+        // Після великого стрибка приймаємо новий час: інакше одна аномалія
+        // назавжди прив'язала б нас до хибної епохи й навігатор бачив би
+        // мітки з майбутнього.
+        if (wall <= lastEmitWall && lastEmitWall - wall < 60000) wall = lastEmitWall + 1;
+        lastEmitWall = wall;
         for (String p : new ArrayList<>(mocked)) {
             Location l = new Location(p);
             l.setLatitude(la);
             l.setLongitude(lo);
             l.setAccuracy(a);
-            l.setTime(System.currentTimeMillis());
+            l.setTime(wall);
             l.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
             if (sp > MIN_MOVE_MPS) {
                 l.setSpeed(sp);
@@ -1867,6 +2015,8 @@ public class FilterService extends Service {
          .append(f1(speedMps * 3.6f)).append(',')
          .append(Obd.ageMs()).append(',')
          .append(nmeaTrusted ? 1 : 0).append(',')
+         .append(drValid ? drSrc : "").append(',')
+         .append(drValid ? f1(drSig) : "").append(',')
          .append(gpsSrc).append(',')
          .append(nmeaSats).append(',')
          .append(nmeaLoc == null ? "" : String.valueOf(SystemClock.elapsedRealtime() - nmeaAt));
@@ -2021,8 +2171,10 @@ public class FilterService extends Service {
         stillSince = 0; fakeMotion = 0; lastCrit = false; precise = false;
         hasHold = false; probeTier = 2; probeFails = 0;
         cValid = false; cPending = null; cLastRaw = null; lastSpeedAt = 0;
+        drValid = false; drDisagree = 0; drSpeed = 0; drLastAnchor = null;
+        drSrc = "—"; drSig0 = 0;
         starvedStreak = 0; starvedLogged = false; netPrev = null; netCur = null;
-        obdStillSince = 0; lastGsvAt = 0; loopStreak = 0;
+        obdStillSince = 0; lastGsvAt = 0; loopStreak = 0; lastEmitWall = 0;
         nmeaTrusted = true; nmeaWhy = "—";
         nmeaLoc = null; nmeaAt = 0; nmeaSats = 0; gpsSrc = "—";
         mockDenied = false; mockDeniedAt = 0; mockDeniedBuzzAt = 0;
