@@ -78,7 +78,7 @@ import java.util.Map;
  */
 public class FilterService extends Service {
 
-    public static final String VER = "9.3";
+    public static final String VER = "9.4";
     public static final String CH_ID = "gnssfilter";
     public static final int NOTIF_ID = 1;
 
@@ -233,8 +233,26 @@ public class FilterService extends Service {
     private static final float DR_SCALE_NOSPD = 0.30f;  // швидкість з опор: ~30%
     /** Дрейф курсу гіроскопа, градусів за секунду. */
     private static final float DR_HDG_DRIFT_DPS = 0.02f;
-    /** Числення без нової опори довше за це — визнаємо, що загубились. */
-    private static final long DR_MAX_MS = 120000;
+    /**
+     * v9.4: раніше числення визнавалось втраченим по годиннику (120с без
+     * опори) — незалежно від того, наскільки чистим лишалось саме числення.
+     * На трасі/мосту з OBD похибка за 120с типово ще ~60-70м — рано здаватись.
+     * У заторі під РЕБ час іде, а похибка від відстані — ні; годинник у
+     * такому разі здавався б без причини. Тому стеля тепер по накопиченій
+     * невизначеності, не по часу: те саме порогове значення, після якого і
+     * груба мережа вже вважається непридатною (NET_ANCHOR_MAX_ACC) — узгоджено
+     * з рештою логіки, не нове довільне число. У місті ніколи не сягається
+     * (мережеві фікси частіші), крім одночасного blackout+РЕБ.
+     */
+    private static final float DR_MAX_SIG_M = NET_ANCHOR_MAX_ACC;
+    /**
+     * v9.4: плаский доданок невизначеності за сам факт часу (страховка на
+     * повзання, яке гістерезис руху міг не помітити). Коли стоїмо і це
+     * підтверджено саме OBD (колеса на нулі, не здогад з акселерометра) —
+     * повзти нікуди, тож доданок майже нульовий. Інакше — як і було.
+     */
+    private static final float DR_BASE_MPS = 0.5f;
+    private static final float DR_BASE_STILL_OBD_MPS = 0.05f;
     /** Мережа наполегливо не сходиться стільки разів — перезапуск опори. */
     private static final int DR_DISAGREE = 4;
 
@@ -1407,11 +1425,11 @@ public class FilterService extends Service {
                     setAnchor(nl, "network(скид)", now);
                 }
             }
-            if (now - drAnchorAt > DR_MAX_MS) {
+            if (drSig > DR_MAX_SIG_M) {
                 drValid = false;
                 drSrc = "—";
-                Logger.event("DR_LOST", "числення без опори понад "
-                        + (DR_MAX_MS / 1000) + " с");
+                Logger.event("DR_LOST", String.format(Locale.US,
+                        "числення розійшлось на ±%.0f м без опори", drSig));
             }
         }
 
@@ -1579,11 +1597,15 @@ public class FilterService extends Service {
             if (Math.abs(k) > 1) drLon += (Math.sin(r) * sp * dt) / k;
         }
 
-        // Невизначеність: частка пройденого шляху плюс бічний знос від дрейфу курсу.
+        // Невизначеність: частка пройденого шляху плюс бічний знос від дрейфу курсу
+        // плюс страховка на повзання, яке гістерезис руху міг не помітити —
+        // майже нульова, якщо саме OBD підтверджує повний нуль на колесах.
         double path = sp * dt;
         float scale = Obd.fresh() ? DR_SCALE_OBD : DR_SCALE_NOSPD;
+        boolean obdConfirmedStill = "obd".equals(motionSrc) && !moving;
+        float base = obdConfirmedStill ? DR_BASE_STILL_OBD_MPS : DR_BASE_MPS;
         double drift = Math.toRadians(DR_HDG_DRIFT_DPS * (now - drAnchorAt) / 1000.0);
-        drSig += (float) (path * scale + Math.abs(path * Math.sin(drift)) + 0.5 * dt);
+        drSig += (float) (path * scale + Math.abs(path * Math.sin(drift)) + base * dt);
     }
 
     /** Остання позиція, в яку ми вірили. Основа утримання без мережі. */
