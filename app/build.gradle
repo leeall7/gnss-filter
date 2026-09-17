@@ -8,8 +8,8 @@ android {
         applicationId "com.gnssfilter"
         minSdk 29
         targetSdk 35
-        versionCode 31
-        versionName "9.3"
+        versionCode 32
+        versionName "9.4"
     }
 
     /**
