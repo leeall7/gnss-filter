@@ -78,7 +78,7 @@ import java.util.Map;
  */
 public class FilterService extends Service {
 
-    public static final String VER = "9.2";
+    public static final String VER = "9.3";
     public static final String CH_ID = "gnssfilter";
     public static final int NOTIF_ID = 1;
 
@@ -810,12 +810,15 @@ public class FilterService extends Service {
             nmeaAt = SystemClock.elapsedRealtime();
             checkLoop(l);
             if (!nmeaTrusted) return;
-            if (!mocked.isEmpty()) {          // під моком провайдер мовчить
-                prevGps = gpsRaw;
-                gpsRaw = l;
-                gpsAt = nmeaAt;
-                gpsSrc = "nmea";
-            }
+            // v9.3: раніше живило gpsRaw лише під моком («без мока провайдер
+            // сам дає фікс»). Тепер — завжди. Причина: зняття моку через
+            // NMEA_TRUST більше не перевидає підписку gpsL (див. removeMock
+            // нижче), тож саме NMEA лишається джерелом, яке не залежить від
+            // того, чи gpsL сам відновив потік від провайдера.
+            prevGps = gpsRaw;
+            gpsRaw = l;
+            gpsAt = nmeaAt;
+            gpsSrc = "nmea";
         }
     };
 
@@ -1281,7 +1284,7 @@ public class FilterService extends Service {
             if (nok && goodStreak >= needN && now - lastStateChangeAt >= MIN_DWELL_MS) {
                 Logger.event("NMEA_TRUST", "довіра повернена через NMEA, без проби");
                 gainTrust(now);
-                removeMock();
+                removeMock(true);   // довіру вже підтвердив NMEA — resub не потрібен
                 setState(S_GREEN, "GPS впевнений");
                 source = "GPS";
                 precise = false;
@@ -1870,7 +1873,26 @@ public class FilterService extends Service {
         }
     }
 
-    private void removeMock() {
+    private void removeMock() { removeMock(false); }
+
+    /**
+     * Польовий лог 12.09 (S26 Ultra, Android 16): після зняття тестового
+     * провайдера справжній GPS-фікс до слухача gpsL НЕ повертався сам —
+     * 13 з 23 втрат довіри були саме цим, петля з періодом 10 с. Тому
+     * підписку на GPS перевидаємо явно, а таймер свіжості фікса запускаємо
+     * з нуля: 8 с на те, щоб фікс знову почав приходити. Це стосується
+     * «сліпої» проби (без NMEA) — там gpsL лишається єдиним джерелом
+     * gpsRaw, і resub тут обов'язковий.
+     *
+     * v9.3: коли довіру повернув NMEA_TRUST, довіру вже підтвердив чіп
+     * напряму, в обхід шару провайдерів — resub тут нічого не перевіряє
+     * заново, лише перезапускає підписку. Лог 17.09 (S26): саме це стало
+     * джерелом повторних втрат довіри кожні 10-20 с (vis 50→11→4,
+     * «азимут0» одразу після resub). Для цього шляху — skipResub=true;
+     * gpsRaw і далі живиться з NMEA (nmeaL, тепер завжди, не лише під
+     * моком), тож розбудити gpsL заново не треба.
+     */
+    private void removeMock(boolean skipResub) {
         if (mocked.isEmpty()) { mockActive = false; mockedProviders = "—"; return; }
         Logger.event("MOCK_REMOVE", String.join(", ", mocked));
         for (String p : new ArrayList<>(mocked)) {
@@ -1883,11 +1905,8 @@ public class FilterService extends Service {
         mockedProviders = "—";
         hasOut = false;
 
-        // Польовий лог 12.09 (S26 Ultra, Android 16): після зняття тестового
-        // провайдера справжній GPS-фікс до слухача НЕ повертався сам —
-        // 13 з 23 втрат довіри були саме цим, петля з періодом 10 с.
-        // Тому підписку на GPS перевидаємо явно, а таймер свіжості фікса
-        // запускаємо з нуля: 8 с на те, щоб фікс знову почав приходити.
+        if (skipResub) return;
+
         try { lm.removeUpdates(gpsL); } catch (Throwable ignored) { }
         try {
             lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000, 0,
