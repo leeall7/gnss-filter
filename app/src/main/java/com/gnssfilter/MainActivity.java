@@ -58,6 +58,12 @@ public class MainActivity extends Activity {
 
     private int dp(int v) { return (int) (v * getResources().getDisplayMetrics().density); }
 
+    /** Висота системного статус-бару — щоб контент не ліз під годинник/батарею. */
+    private int statusBarHeight() {
+        int id = getResources().getIdentifier("status_bar_height", "dimen", "android");
+        return id > 0 ? getResources().getDimensionPixelSize(id) : dp(24);
+    }
+
     private GradientDrawable rounded(int color, int radiusDp) {
         GradientDrawable d = new GradientDrawable();
         d.setCornerRadius(dp(radiusDp));
@@ -96,8 +102,9 @@ public class MainActivity extends Activity {
         b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         b.setBackground(rounded(bg, 12));
         b.setOnClickListener(l);
+        b.setMinHeight(dp(44));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                0, dp(44), weight);
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, weight);
         lp.setMargins(dp(3), 0, dp(3), 0);
         parent.addView(b, lp);
         return b;
@@ -141,7 +148,7 @@ public class MainActivity extends Activity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(BG);
-        root.setPadding(dp(12), dp(12), dp(12), dp(12));
+        root.setPadding(dp(12), dp(12) + statusBarHeight(), dp(12), dp(12));
 
         // --- герой: стан ---
         hero = new LinearLayout(this);
@@ -251,7 +258,7 @@ public class MainActivity extends Activity {
                         .show();
             }
         });
-        button(small, "Скинути масштаб OBD", 0xFFE4E7EB, INK, 1f, new View.OnClickListener() {
+        button(small, "Скинути OBD", 0xFFE4E7EB, INK, 1f, new View.OnClickListener() {
             @Override public void onClick(View v) {
                 new AlertDialog.Builder(MainActivity.this)
                         .setTitle("Скинути калібрування OBD?")
