@@ -230,11 +230,47 @@ public class MainActivity extends Activity {
                 toast("Тестові провайдери знято");
             }
         });
-        button(small, "База AGC", 0xFFE4E7EB, INK, 1f, new View.OnClickListener() {
+        button(small, "Скинути AGC", 0xFFE4E7EB, INK, 1f, new View.OnClickListener() {
             @Override public void onClick(View v) {
-                FilterService.resetAgcBase(MainActivity.this);
-                FilterService.agcBaseKnown = false;
-                toast("Базу знято, вчитиметься заново");
+                new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("Скинути базу AGC?")
+                        .setMessage("Лише після зміни кріплення, антени чи авто — "
+                                + "коли нормальний рівень AGC дійсно став іншим "
+                                + "назавжди. Стара база стирається, нова вчиться "
+                                + "заново (мінімум 30 вимірів при довіреному GPS) — "
+                                + "до того часу застосунок не відрізнить справжнє "
+                                + "глушіння від щойно скинутої бази.")
+                        .setPositiveButton("Скинути", new DialogInterface.OnClickListener() {
+                            @Override public void onClick(DialogInterface d, int w) {
+                                FilterService.resetAgcBase(MainActivity.this);
+                                FilterService.agcBaseKnown = false;
+                                toast("Базу знято, вчитиметься заново");
+                            }
+                        })
+                        .setNegativeButton("Скасувати", null)
+                        .show();
+            }
+        });
+        button(small, "Скинути масштаб OBD", 0xFFE4E7EB, INK, 1f, new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("Скинути калібрування OBD?")
+                        .setMessage("Лише якщо пересіли на інше авто — заміна шин на "
+                                + "тому самому авто підлаштовується сама, без кнопки, "
+                                + "за кілька хвилин упевненої їзди. Значення "
+                                + "повертається до 1.0 (без поправки) — повне "
+                                + "перенавчання почнеться з наступного запуску "
+                                + "застосунку.")
+                        .setPositiveButton("Скинути", new DialogInterface.OnClickListener() {
+                            @Override public void onClick(DialogInterface d, int w) {
+                                FilterService.resetObdScale(MainActivity.this);
+                                FilterService.obdScale = 1.0f;
+                                FilterService.obdScaleKnown = false;
+                                toast("Масштаб знято, вчитиметься заново");
+                            }
+                        })
+                        .setNegativeButton("Скасувати", null)
+                        .show();
             }
         });
         button(small, "Логи ↗", ACCENT, Color.WHITE, 1f, new View.OnClickListener() {
