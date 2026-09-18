@@ -78,7 +78,7 @@ import java.util.Map;
  */
 public class FilterService extends Service {
 
-    public static final String VER = "9.9";
+    public static final String VER = "9.9.3";
     public static final String CH_ID = "gnssfilter";
     public static final int NOTIF_ID = 1;
 
@@ -157,6 +157,17 @@ public class FilterService extends Service {
     /** Після кількох поспіль невдалих проб інтервал росте: спуфер нікуди не подівся. */
     private static final int PROBE_BACKOFF_AFTER = 3;
     private static final long PROBE_INT_MAX_MS = 180000;
+    /**
+     * v9.9.3: стеля 180000 (3 хв) розрахована на «звичайну» відсутність
+     * сигналу. Лог 18.09: 21 хвилина суцільної завади (AGC), 7 проб поспіль,
+     * кожна — GPS_RESUB і невдача. GSV весь цей час показував рівний нуль —
+     * тобто ми й так знали, що перевіряти рано, просто не дивились. Коли GSV
+     * підтверджує порожнє небо (не бачив жодного супутника зі сигналом
+     * GSV_SILENCE_MS і довше), дозволяємо стелі рости далі цієї межі.
+     */
+    private static final long PROBE_INT_BLACKOUT_MS = 480000;
+    /** А щойно GSV показав хоч щось — сенсу чекати немає, перевіряємо майже одразу. */
+    private static final long PROBE_INT_GSV_ALIVE_MS = 30000;
     private static final int STREAK_PRECISE = 20, STREAK_COARSE = 40, STREAK_BLIND = 60;
     private static final long PROBE_MAX_MS = 25000, PROBE_MAX_COARSE_MS = 50000,
             PROBE_MAX_BLIND_MS = 75000;
@@ -403,6 +414,16 @@ public class FilterService extends Service {
     private Location drLastAnchor;
     /** Час (getElapsedRealtimeNanos) фікса, який уже зливали — щоб не бити по тому самому щотику. */
     private long drLastFusedAt = -1;
+    /**
+     * v9.9.3: поправка від злиття більше не застосовується миттєво. Лог
+     * 18.09: під час завади фікси з net_acc 27-122м давали одноразові
+     * стрибки показаної точки до 209м за секунду — вага (k) рахувалась
+     * правильно, але наносилась одним тиком, і навігатор бачив телепорт.
+     * Тепер поправка накопичується тут і зноситься по частці щосекунди
+     * (deadReckon) — та сама підсумкова точність, без миттєвого ривка.
+     */
+    private double drCorrLat = 0, drCorrLon = 0;
+    private static final double DR_CORR_SPREAD_S = 4.0;
     public static volatile String drSrc = "—";
     public static volatile float drSig0 = 0;
     private int starvedStreak = 0;
@@ -411,6 +432,18 @@ public class FilterService extends Service {
     private Location nmeaLoc;
     private long nmeaAt = 0;
     private long lastGsvAt = 0;
+    /**
+     * v9.9.3: скільки супутників GSV бачить із ненульовим SNR — раніше цю
+     * інформацію рахували, але одразу викидали (лишали тільки булеве «є
+     * потік чи ні»). GGA каже нуль, коли фікс порахувати не вдалось, GSV —
+     * що приймач насправді бачить, навіть слабко, навіть без готового фіксу.
+     * Не пускаємо це в довіру (слабкий SNR — не те саме, що придатний
+     * супутник, тут і раніше ловили хибні спрацювання), лише в розклад проб:
+     * лог 18.09 — 21 хвилина суцільного «завада», проба щоразу невдала й
+     * щоразу перевидає підписку, хоча вже за перші кілька невдач ясно, що
+     * перевіряти нема сенсу так часто.
+     */
+    private volatile int gsvSats = 0;
     private int loopStreak = 0;
     private double loopFromLat = 0, loopFromLon = 0;
     public static volatile boolean nmeaTrusted = true;
@@ -889,8 +922,11 @@ public class FilterService extends Service {
             if (m == null) return;
             String t = Nmea.type(m);
             if ("GSV".equals(t)) {
-                if (Nmea.checksumOk(m) && Nmea.countGsvSnr(m) > 0)
-                    lastGsvAt = SystemClock.elapsedRealtime();
+                if (Nmea.checksumOk(m)) {
+                    int n = Nmea.countGsvSnr(m);
+                    gsvSats = n;
+                    if (n > 0) lastGsvAt = SystemClock.elapsedRealtime();
+                }
                 return;
             }
             if (!"GGA".equals(t) && !"RMC".equals(t)) return;
@@ -1249,7 +1285,16 @@ public class FilterService extends Service {
                 loseTrust(verdict, now);
                 // далі — гілка «під моком» у цьому ж циклі
             } else {
-                boolean weakNow = usedInFix < MIN_USED + 2 || !spoofFlags.equals("—")
+                // v9.9.3: AGC-only (без інших ознак) більше не тягне в жовтий —
+                // лог 18.09 показав медіану 33 супутники у фіксі й 76 видимих
+                // саме в такі моменти: AGC каже «завада присутня», а не «сигнал
+                // слабкий», і напис «GPS слабкий» тоді просто вводив в оману.
+                // Сама ознака нікуди не зникає — flags/spoofFlags і далі
+                // пишуться в лог, лише колір/напис більше не занижують довіру
+                // без причини. Справжня слабкість (мало супутників, інші
+                // голоси, свіжий badStreak) і далі йде в жовтий як раніше.
+                boolean weakNow = usedInFix < MIN_USED + 2
+                        || (!spoofFlags.equals("—") && !spoofFlags.equals("AGC"))
                         || badStreak > 0;
                 if (weakNow) strongStreak = 0; else strongStreak++;
                 boolean weak = weakNow
@@ -1434,8 +1479,21 @@ public class FilterService extends Service {
         // Кожна невдала проба подвоює паузу: приймач, що не прокидається,
         // не має права тримати мок знятим.
         long gap = Math.max(spoofLatch ? interval : PROBE_MIN_GAP_MS, PROBE_MIN_GAP_MS);
-        if (probeFails > 0)
-            gap = Math.min(PROBE_INT_MAX_MS, gap * (1L << Math.min(3, probeFails)));
+        if (probeFails > 0) {
+            // v9.9.3: GSV каже, чи є взагалі сенс перевіряти. Свіжий сигнал
+            // (щось помічено за GSV_SILENCE_MS) — перевіряємо майже одразу,
+            // без стандартного подвоєння. Підтверджено порожнє небо — стеля
+            // росте й далі звичних 180000, а не впирається в неї відразу.
+            boolean gsvAlive = lastGsvAt > 0
+                    && now - lastGsvAt <= GSV_SILENCE_MS;
+            if (gsvAlive) {
+                gap = PROBE_INT_GSV_ALIVE_MS;
+            } else {
+                gap = gap * (1L << Math.min(3, probeFails));
+                long ceiling = lastGsvAt > 0 ? PROBE_INT_BLACKOUT_MS : PROBE_INT_MAX_MS;
+                gap = Math.min(ceiling, gap);
+            }
+        }
         boolean cooled = now - lastProbeEnd >= gap;
         boolean overdue = !spoofLatch && now - lastProbeEnd >= PROBE_MAX_GAP_MS
                 && now - lastStateChangeAt >= MIN_DWELL_MS;
@@ -1684,10 +1742,10 @@ public class FilterService extends Service {
         }
         drDisagree = 0;
         double k = (double) (drSig * drSig) / (drSig * drSig + a * a);
-        // Різниця, виміряна В МОМЕНТ ФІКСА, зноситься на поточну точку —
-        // незалежно від того, куди нас відтоді провело числення.
-        drLat += k * (nl.getLatitude() - pLat);
-        drLon += k * (nl.getLongitude() - pLon);
+        // Різниця, виміряна В МОМЕНТ ФІКСА, накопичується в чергу поправки —
+        // деталі зносу дивись deadReckon(); тут лише рахуємо, скільки і куди.
+        drCorrLat += k * (nl.getLatitude() - pLat);
+        drCorrLon += k * (nl.getLongitude() - pLon);
         drSig = (float) Math.max(DR_SIG_MIN, Math.sqrt((1 - k) * drSig * drSig));
         drLastAnchor = new Location(nl);
         drLastFusedAt = nl.getElapsedRealtimeNanos();
@@ -1718,6 +1776,7 @@ public class FilterService extends Service {
         drSrc = src;
         // Буфер історії — з чистого аркуша: старі точки належать іншому
         // епізоду й не повинні потрапити під звірку майбутнього фікса.
+        drCorrLat = 0; drCorrLon = 0;   // нова опора — черга поправки від старої втратила сенс
         histClear();
         histPush(now);
     }
@@ -1743,6 +1802,7 @@ public class FilterService extends Service {
         drDisagree = 0;
         drLastAnchor = new Location(l);
         drSrc = src;
+        drCorrLat = 0; drCorrLon = 0;   // нова опора — черга поправки від старої втратила сенс
         histClear();
         histPush(now);
     }
@@ -1765,6 +1825,17 @@ public class FilterService extends Service {
             drLat += (Math.cos(r) * sp * dt) / M_PER_DEG;
             double k = M_PER_DEG * Math.cos(Math.toRadians(drLat));
             if (Math.abs(k) > 1) drLon += (Math.sin(r) * sp * dt) / k;
+        }
+
+        // v9.9.3: зносимо чергу поправки від злиття часткою за тик — те, що
+        // лишається, доноситься наступного разу. Практично весь залишок
+        // йде за DR_CORR_SPREAD_S секунд, а на кожному конкретному тику рух
+        // від цього виглядає як звичайне прискорення, а не стрибок.
+        if (drCorrLat != 0 || drCorrLon != 0) {
+            double frac = Math.min(1.0, dt / DR_CORR_SPREAD_S);
+            double stepLat = drCorrLat * frac, stepLon = drCorrLon * frac;
+            drLat += stepLat; drLon += stepLon;
+            drCorrLat -= stepLat; drCorrLon -= stepLon;
         }
 
         // Невизначеність: частка пройденого шляху плюс бічний знос від дрейфу курсу
@@ -2469,6 +2540,7 @@ public class FilterService extends Service {
         cValid = false; cPending = null; cLastRaw = null; lastSpeedAt = 0;
         drValid = false; drDisagree = 0; drSpeed = 0; drLastAnchor = null;
         drSrc = "—"; drSig0 = 0; drLastFusedAt = -1; histClear();
+        drCorrLat = 0; drCorrLon = 0;
         starvedStreak = 0; starvedLogged = false; netPrev = null; netCur = null;
         obdStillSince = 0; lastGsvAt = 0; loopStreak = 0; lastEmitWall = 0;
         nmeaTrusted = true; nmeaWhy = "—";

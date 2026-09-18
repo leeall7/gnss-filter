@@ -280,9 +280,6 @@ public class MainActivity extends Activity {
                         .show();
             }
         });
-        button(small, "Логи ↗", ACCENT, Color.WHITE, 1f, new View.OnClickListener() {
-            @Override public void onClick(View v) { askExport(); }
-        });
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         slp.setMargins(0, 0, 0, dp(10));
@@ -369,6 +366,15 @@ public class MainActivity extends Activity {
         });
         root.addView(diagBtn);
         diagBox = card(root);
+        LinearLayout logsRow = new LinearLayout(this);
+        logsRow.setOrientation(LinearLayout.HORIZONTAL);
+        button(logsRow, "Логи ↗", ACCENT, Color.WHITE, 1f, new View.OnClickListener() {
+            @Override public void onClick(View v) { askExport(); }
+        });
+        LinearLayout.LayoutParams logsLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        logsLp.setMargins(0, 0, 0, dp(10));
+        diagBox.addView(logsRow, logsLp);
         diag = text(diagBox, "", 12, INK, false);
         diag.setTypeface(Typeface.MONOSPACE);
         diagBox.setVisibility(View.GONE);
