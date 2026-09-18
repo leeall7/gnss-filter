@@ -22,6 +22,7 @@ import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.CompoundButton;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
@@ -345,6 +346,58 @@ public class MainActivity extends Activity {
         });
         set.addView(sb);
         updateTh();
+
+        // --- v9.9.5: ручна точка — рівень довіри GPS ---
+        text(set, "Ручна точка (координати, наприклад скопійовані з Google Maps):",
+                13, INK, false);
+        final EditText manualFixInput = new EditText(this);
+        manualFixInput.setHint("50.4724897, 30.4469780");
+        manualFixInput.setSingleLine(true);
+        manualFixInput.setTextColor(INK);
+        manualFixInput.setBackground(rounded(0xFFE4E7EB, 10));
+        manualFixInput.setPadding(dp(10), dp(8), dp(10), dp(8));
+        LinearLayout.LayoutParams mfLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        mfLp.setMargins(0, dp(4), 0, dp(8));
+        set.addView(manualFixInput, mfLp);
+        LinearLayout manualFixRow = new LinearLayout(this);
+        manualFixRow.setOrientation(LinearLayout.HORIZONTAL);
+        button(manualFixRow, "Встановити поточну точку", ACCENT, Color.WHITE, 1f,
+                new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                String raw = manualFixInput.getText().toString().trim();
+                // "50,4724897, 30,4469780" — деякі локалі Maps віддають кому
+                // і як роздільник дробової частини, і як роздільник між
+                // широтою й довготою. Якщо в рядку є крапка — це звичайний
+                // формат (крапка-десятковий), ділимо просто по комі. Якщо
+                // крапки немає — кома-десятковий формат, тоді ділимо лише
+                // по "кома+пробіл" (роздільник між координатами завжди має
+                // пробіл після себе, дробова кома — ніколи).
+                String[] parts = raw.contains(".") ? raw.split(",") : raw.split(",\\s+");
+                if (parts.length != 2) {
+                    toast("Формат: широта, довгота — напр. 50.4724897, 30.4469780");
+                    return;
+                }
+                double la, lo;
+                try {
+                    la = Double.parseDouble(parts[0].trim().replace(',', '.'));
+                    lo = Double.parseDouble(parts[1].trim().replace(',', '.'));
+                } catch (NumberFormatException e) {
+                    toast("Не вдалось розібрати координати");
+                    return;
+                }
+                if (la < -90 || la > 90 || lo < -180 || lo > 180) {
+                    toast("Координати поза діапазоном");
+                    return;
+                }
+                FilterService.pendingManualLat = la;
+                FilterService.pendingManualLon = lo;
+                toast(String.format(java.util.Locale.US,
+                        "Точку встановлено: %.6f, %.6f — мережа заблокована на 20с",
+                        la, lo));
+            }
+        });
+        set.addView(manualFixRow);
 
         // --- легенда ---
         LinearLayout leg = card(root);

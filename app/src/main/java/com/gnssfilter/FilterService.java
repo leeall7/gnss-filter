@@ -53,6 +53,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Random;
 
 /**
  * GNSS Filter v5.
@@ -78,7 +79,7 @@ import java.util.Map;
  */
 public class FilterService extends Service {
 
-    public static final String VER = "9.9.3";
+    public static final String VER = "9.9.7";
     public static final String CH_ID = "gnssfilter";
     public static final int NOTIF_ID = 1;
 
@@ -383,6 +384,18 @@ public class FilterService extends Service {
     public static volatile boolean showDot = true;
     public static volatile boolean vibrate = true;
 
+    /**
+     * v9.9.5: ручний ввід поточної точки з UI (рівень довіри GPS). MainActivity
+     * пише сюди, а step() сам забирає на початку наступного тику — той самий
+     * патерн, що й moving/accStd/accThreshold, бо в сервісі немає Binder чи
+     * статичного посилання на живий інстанс, щоб викликати інстансний метод
+     * напряму. Double.NaN = порожньо, нічого не чекає на обробку.
+     */
+    public static volatile double pendingManualLat = Double.NaN;
+    public static volatile double pendingManualLon = Double.NaN;
+    private static final float MANUAL_FIX_ACC_M = 5f;
+    private static final long MANUAL_LOCK_MS = 20000;
+
     private LocationManager lm;
     private Handler h;
     private PowerManager.WakeLock wl;
@@ -409,6 +422,15 @@ public class FilterService extends Service {
     private float drSig = 0;
     private boolean drValid = false;
     private long drAt = 0, drAnchorAt = 0;
+    /** До цього моменту (elapsedRealtime) мережа не зливається й не стає опорою — щойно вручну задана точка. */
+    private long manualLockUntil = 0;
+    // v9.9.6: висота — з останнього довіреного GPS-фікса, тримаємо, поки
+    // немає свіжішої (сама по собі майже не змінюється вздовж дороги).
+    private double lastAltM = 0;
+    private boolean altKnown = false;
+    /** Джитер швидкості на стоянці — щоб не видавати підозріло рівний нуль. */
+    private final Random rnd = new Random();
+    private static final float STILL_SPEED_MAX_MPS = 0.15f;   // виміряно на польових логах: 90-й перцентиль
     private float drSpeed = 0;          // м/с, остання оцінка
     private int drDisagree = 0;
     private Location drLastAnchor;
@@ -580,6 +602,28 @@ public class FilterService extends Service {
         while (h >= 360) h -= 360;
         return h;
     }
+
+    /**
+     * v9.9.7: барометр, якщо є. Тиск сам по собі не дає абсолютної висоти
+     * (залежить від погоди), тому не рахуємо від нього напряму — беремо як
+     * ЗМІНУ від калібрувальної пари (тиск+висота в момент останнього
+     * довіреного GPS-фікса). Це саме різниця висоти з часу останньої опори,
+     * а не абсолютний барометричний розрахунок. Якщо барометра немає, чи
+     * він ще не встиг дати жодного показу — відкат на просте тримання
+     * lastAltM, як було в 9.9.6.
+     */
+    private final SensorEventListener presL = new SensorEventListener() {
+        @Override public void onSensorChanged(SensorEvent e) {
+            curPressureHpa = e.values[0];
+            pressureKnown = true;
+        }
+        @Override public void onAccuracyChanged(Sensor s, int a) { }
+    };
+    private volatile float curPressureHpa = 0;
+    private volatile boolean pressureKnown = false;
+    /** Тиск (гПа) саме в момент, коли захопили lastAltM — калібрувальна пара. */
+    private float lastPressureHpa = 0;
+    private boolean baroCalibrated = false;
 
     private void seedHeading(float bearing) {
         hdgOffset = bearing - rawYaw;
@@ -1252,6 +1296,21 @@ public class FilterService extends Service {
         long now = SystemClock.elapsedRealtime();
         updateMotion();
 
+        // v9.9.5: ручна точка з UI — забираємо, щойно вона з'явилась.
+        if (!Double.isNaN(pendingManualLat)) {
+            double la = pendingManualLat, lo = pendingManualLon;
+            pendingManualLat = Double.NaN; pendingManualLon = Double.NaN;
+            Location l = new Location("manual");
+            l.setLatitude(la); l.setLongitude(lo);
+            l.setAccuracy(MANUAL_FIX_ACC_M);
+            l.setTime(System.currentTimeMillis());
+            l.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
+            setAnchorAt(la, lo, MANUAL_FIX_ACC_M, l, "ручний ввід", now);
+            manualLockUntil = now + MANUAL_LOCK_MS;
+            Logger.event("MANUAL_FIX", String.format(Locale.US,
+                    "%.6f, %.6f — мережа заблокована на %d с", la, lo, MANUAL_LOCK_MS / 1000));
+        }
+
         // --- прогрів: до першого фікса або 10 с; мок не ставимо ---
         if (warm) {
             if (now - startedAt < WARMUP_MS && gpsRaw == null && usedInFix == 0) {
@@ -1302,6 +1361,15 @@ public class FilterService extends Service {
                 setState(weak ? S_YELLOW : S_GREEN, weak ? "GPS слабкий" : "GPS впевнений");
                 if (!weak && !spoofLatch) { learnAgc(); learnObdScale(gpsRaw); }
                 Location gg = gpsRaw;
+                if (gg != null && gg.hasAltitude()) {
+                    lastAltM = gg.getAltitude();
+                    altKnown = true;
+                    // Свіжа калібрувальна пара тиск+висота — щоразу, коли є
+                    // і те, і те: так барометричний відлік завжди рахується
+                    // від НАЙостаннішої довіреної опори, а не від старої.
+                    if (pressureKnown) { lastPressureHpa = curPressureHpa; baroCalibrated = true; }
+                    else baroCalibrated = false;
+                }
                 if (gg != null && gg.hasBearing() && gg.hasSpeed() && gg.getSpeed() > MIN_MOVE_MPS)
                     seedHeading(gg.getBearing());   // справжній курс — еталон для гіроскопа
                 if (gg != null && gg.hasSpeed()) {
@@ -1724,6 +1792,7 @@ public class FilterService extends Service {
      * самий тест: 36м→20м на повільній ділянці, 125м→55м на швидкій.
      */
     private void fuseNet(Location nl, long now) {
+        if (now < manualLockUntil) return;   // щойно вручну задана точка — даємо їй прижитись
         double[] past = histLookup(now - ageMs(nl));
         double pLat = past != null ? past[0] : drLat;
         double pLon = past != null ? past[1] : drLon;
@@ -1741,6 +1810,15 @@ public class FilterService extends Service {
             return;
         }
         drDisagree = 0;
+        // v9.9.4: сам повзунок «Поріг точності мережі» тепер вирішує, чи
+        // цей фікс узагалі підтягує числення — не лише чи він стає опорою
+        // для екстраполяції (те вже робив reject()). До цього застереження
+        // тут не було: будь-який фікс, що пройшов лише перевірку на різку
+        // незгоду, тягнув траєкторію на свою вагу k, навіть грубий
+        // (150-180м) — назбирано за багато циклів, це й давало пилку на
+        // реальних треках (порівняння з дійсним шляхом, 18.09). Аварійний
+        // скид нижче цю перевірку не питає — то окрема страховка.
+        if (nl.getAccuracy() > accThreshold) return;
         double k = (double) (drSig * drSig) / (drSig * drSig + a * a);
         // Різниця, виміряна В МОМЕНТ ФІКСА, накопичується в чергу поправки —
         // деталі зносу дивись deadReckon(); тут лише рахуємо, скільки і куди.
@@ -1911,6 +1989,10 @@ public class FilterService extends Service {
 
     private String reject(Location n) {
         rejectCode = 0;
+        if (SystemClock.elapsedRealtime() < manualLockUntil) {
+            rejectCode = 5;
+            return "щойно вручну задана точка — мережа заблокована";
+        }
         if (!n.hasAccuracy()) { rejectCode = 1; return "немає поля accuracy"; }
         long a = ageMs(n);
         if (a > MAX_NET_AGE_MS) {
@@ -2079,12 +2161,40 @@ public class FilterService extends Service {
             l.setAccuracy(a);
             l.setTime(wall);
             l.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
+            // v9.9.7: висота — з барометра, якщо є свіжа калібрувальна пара
+            // (тиск+висота з моменту останньої довіреної опори); інакше —
+            // просте тримання lastAltM, як у 9.9.6. Справжній фікс завжди
+            // несе висоту (трилатерація тривимірна), мовчати тут — не те,
+            // що видає реальний чіп.
+            if (altKnown) {
+                double altToEmit = lastAltM;
+                boolean fromBaro = baroCalibrated && pressureKnown;
+                if (fromBaro) {
+                    altToEmit = lastAltM + SensorManager.getAltitude(lastPressureHpa, curPressureHpa);
+                }
+                l.setAltitude(altToEmit);
+                l.setVerticalAccuracyMeters(fromBaro ? 5f : 15f);
+            }
             if (sp > MIN_MOVE_MPS) {
                 l.setSpeed(sp);
                 l.setSpeedAccuracyMetersPerSecond(Math.max(1f, sp * 0.3f));
                 if (br >= 0) {
                     l.setBearing(br);
                     l.setBearingAccuracyDegrees(25f);
+                }
+            } else {
+                // v9.9.6: на стоянці справжній GPS теж не мовчить — виміряно
+                // на власних польових логах (сирий фікс, OBD підтверджує
+                // нуль): медіана 0, 90-й перцентиль ≤0.14 м/с. Порожні поля
+                // тут виглядали б підозріліше за маленький шум. Курс не
+                // вигадуємо наново щотику — тримаємо останній відомий,
+                // бо стрибки азимута на стоянці — саме та ознака, яку й
+                // сам детектор підміни ловить як голос "азимут0".
+                l.setSpeed((float) (STILL_SPEED_MAX_MPS * rnd.nextDouble()));
+                l.setSpeedAccuracyMetersPerSecond(0.5f);
+                if (hdgValid) {
+                    l.setBearing((float) heading());
+                    l.setBearingAccuracyDegrees(45f);
                 }
             }
             try { lm.setTestProviderLocation(p, l); }
@@ -2570,10 +2680,14 @@ public class FilterService extends Service {
             Sensor gy = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
             if (gy != null) sm.registerListener(gyroL, gy, SensorManager.SENSOR_DELAY_GAME);
             else Logger.event("NO_GYRO", "гіроскопа немає — курс лише з мережі");
+            Sensor pr = sm.getDefaultSensor(Sensor.TYPE_PRESSURE);
+            if (pr != null) sm.registerListener(presL, pr, SensorManager.SENSOR_DELAY_NORMAL);
+            else Logger.event("NO_BARO", "барометра немає — висота тримається з останнього GPS");
         } catch (Throwable t) { Logger.event("NO_ACCEL", t.toString()); }
         accCnt = 0; accIdx = 0; stillStreak = 0; moving = false; hasStill = false;
         hdgValid = false; hdgAbs = false; hdgDeg = -1; gyroTs = 0;
         rawYaw = 0; hdgOffset = 0; gyroSeen = false; obdMismatch = 0;
+        pressureKnown = false; baroCalibrated = false; altKnown = false;
         if (Obd.enabled) Obd.start(this);
 
         nmeaLoc = null; nmeaAt = 0; nmeaSats = 0; gpsSrc = "—";
@@ -2622,6 +2736,7 @@ public class FilterService extends Service {
         h.removeCallbacks(pump);
         try { if (sm != null) sm.unregisterListener(accL); } catch (Throwable ignored) { }
         try { if (sm != null) sm.unregisterListener(gyroL); } catch (Throwable ignored) { }
+        try { if (sm != null) sm.unregisterListener(presL); } catch (Throwable ignored) { }
         Obd.stop();
         try { lm.removeNmeaListener(nmeaL); } catch (Throwable ignored) { }
         try { lm.unregisterGnssStatusCallback(statusCb); } catch (Throwable ignored) { }
