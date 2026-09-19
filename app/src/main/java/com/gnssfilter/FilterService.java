@@ -79,7 +79,7 @@ import java.util.Random;
  */
 public class FilterService extends Service {
 
-    public static final String VER = "9.9.7";
+    public static final String VER = "9.9.8";
     public static final String CH_ID = "gnssfilter";
     public static final int NOTIF_ID = 1;
 
