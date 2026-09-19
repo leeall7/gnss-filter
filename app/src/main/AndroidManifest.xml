@@ -25,7 +25,8 @@
 
     <application
         android:label="GNSS Filter"
-        android:icon="@android:drawable/ic_menu_mylocation"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:allowBackup="false">
 
